@@ -1,6 +1,7 @@
 # The lock
 
     lock\heavy.cmd [--exclusive] [--name TEXT] [--estimate 90s, 10m or 2h] COMMAND LINE...
+    lock\heavy.cmd --detach [--log FILE] [the same options] COMMAND LINE...
     lock\heavy.cmd --status
 
 - **One heavy job at a time:** the command runs while it holds the machine's one heavy slot. Builds,
@@ -22,6 +23,25 @@
 - **No benchmarks here:** with `ROOT\no-benchmarks`, an `--exclusive` job is refused at once (exit 2).
 - **CI:** with `CI` or `GITHUB_ACTIONS` set, the command runs straight away.
 - **Exit code:** the command's.
+
+## Detached jobs
+
+`--detach` returns at once and the job (its wait included) runs in a process of its own, outside the
+caller's process tree: whatever ends the caller leaves it running. The Claude desktop app, for one, stops
+a Claude Code session an hour after its last turn and ends every process the session started, a
+`heavy.cmd` waiting in the background included (2026-11-24).
+
+- **Output:** in `--log FILE` (relative to the folder), else `ROOT\detached\ID.log`; heavy.cmd prints
+  which. The log starts with a line naming the job and ends with `heavy: detached job ended ... with exit
+  code N.`; `FILE.exit` appears then, holding the exit code. A new job with the same log empties it and
+  removes the old `.exit` first.
+- **The same job:** queued, run and shown on the pages as any other, with the caller's folder and
+  environment (without secrets, as for travelling jobs: a variable whose name has TOKEN, SECRET,
+  PASSWORD, ... stays out) and the thread title.
+- **How:** WMI starts lock\detached.ps1 (Win32_Process.Create), so its parent is WMI's service and it is
+  in no job object of the caller's. The job file it reads (`ROOT\detached\ID.json`) is removed once read.
+- **Not inside a heavy job:** `--detach` there is refused (exit 2), as the job would run without the slot
+  once its parent ended.
 
 ## Jobs that travel
 

@@ -3,7 +3,12 @@
 # same slot and then also waits until the machine is otherwise idle.
 #
 #   heavy.cmd [--exclusive] [--name TEXT] [--estimate 90s|10m|2h] [--local | --travel] COMMAND LINE...
+#   heavy.cmd --detach [--log FILE] [the same options] COMMAND LINE...
 #   heavy.cmd --status
+#
+# --detach returns at once and runs the job (its wait included) in a process of its own outside the caller's
+# process tree, its output in a log file and its exit code in LOG.exit (lock\detached.ps1): a job that
+# outlives whoever started it, such as a Claude session the desktop app stops after an hour without a turn.
 #
 # A waiting job may run on another machine instead, in the same folder (lock\travel.ps1): --local keeps it
 # here, --travel lets an --exclusive one go too.
@@ -31,8 +36,13 @@ $given = ''
 $stayHere = $false
 $mayTravel = $false
 $travelledFile = ''
+$detach = $false
+$logGiven = ''
 while ($true)
 {
+  if ($line -match '^--detach(\s+|$)(.*)$') { $detach = $true; $line = $matches[2]; continue }
+  if ($line -match '^--log\s+"([^"]+)"\s*(.*)$') { $logGiven = $matches[1]; $line = $matches[2]; continue }
+  if ($line -match '^--log\s+(\S+)\s*(.*)$') { $logGiven = $matches[1]; $line = $matches[2]; continue }
   if ($line -match '^--exclusive(\s+|$)(.*)$') { $exclusive = $true; $line = $matches[2]; continue }
   if ($line -match '^--estimate\s+(\S+)\s*(.*)$') { $given = $matches[1]; $line = $matches[2]; continue }
   if ($line -match '^--status(\s+|$)(.*)$') { $status = $true; $line = $matches[2]; continue }
@@ -395,7 +405,58 @@ tick(); setInterval(tick, 1000);
 }
 
 if ($status) { Show-Status; Write-Page; exit 0 }
-if (-not $line -and -not $travelledFile) { 'usage: heavy.cmd [--exclusive] [--name TEXT] [--estimate 90s|10m|2h] [--local | --travel] COMMAND LINE...  |  heavy.cmd --status'; exit 2 }
+if (-not $line -and -not $travelledFile) { 'usage: heavy.cmd [--detach [--log FILE]] [--exclusive] [--name TEXT] [--estimate 90s|10m|2h] [--local | --travel] COMMAND LINE...  |  heavy.cmd --status'; exit 2 }
+if ($logGiven -and -not $detach) { [Console]::Error.WriteLine('heavy: --log goes with --detach.'); exit 2 }
+
+# --detach: the same job, started by WMI (so its parent is WMI's service, not this process: whatever ends
+# the caller's process tree or job object leaves it running), queued and run as any other. This process
+# returns at once. The job's environment is this one, without secrets (written to disk for the moment it
+# takes the job to start, as travelling jobs leave them out too).
+if ($detach)
+{
+  if ($env:HEAVY_QUEUE_HELD -or ($heldVariable -and [Environment]::GetEnvironmentVariable($heldVariable)))
+  {
+    [Console]::Error.WriteLine('heavy: --detach inside a heavy job: the job would run without the slot once its parent ends.')
+    exit 2
+  }
+  $detachDir = Join-Path $root 'detached'
+  New-Item -ItemType Directory -Force $detachDir | Out-Null
+  $id = '{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $PID
+  $log = if ($logGiven) { [IO.Path]::GetFullPath([IO.Path]::Combine((Get-Location).Path, $logGiven)) } else { Join-Path $detachDir "$id.log" }
+  $options = @()
+  if ($exclusive) { $options += '--exclusive' }
+  if ($name) { $options += "--name `"$name`"" }
+  if ($given) { $options += "--estimate $given" }
+  if ($stayHere) { $options += '--local' }
+  if ($mayTravel) { $options += '--travel' }
+  $whole = (@($options) + $line) -join ' '
+  $environment = Travel-Environment
+  foreach ($n in @('COMPUTERNAME', 'TEMP', 'TMP', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'ProgramData', 'ALLUSERSPROFILE', 'windir', 'SystemRoot', 'SystemDrive', 'OS', 'ComSpec', 'PSModulePath', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE'))
+  {
+    $v = [Environment]::GetEnvironmentVariable($n)
+    if ($null -ne $v) { $environment[$n] = $v } # (the same machine: its own folders stay)
+  }
+  if ($env:HEAVY_QUEUE_CONFIG) { $environment['HEAVY_QUEUE_CONFIG'] = $env:HEAVY_QUEUE_CONFIG }
+  if ($env:HEAVY_QUEUE_THREAD) { $environment['HEAVY_QUEUE_THREAD'] = $env:HEAVY_QUEUE_THREAD }
+  New-Item -ItemType Directory -Force (Split-Path $log) | Out-Null
+  Remove-Item -LiteralPath "$log.exit" -Force -ErrorAction SilentlyContinue
+  [IO.File]::WriteAllText($log, '', (New-Object System.Text.UTF8Encoding($false)))
+  $jobFile = Join-Path $detachDir "$id.json"
+  $job = [ordered]@{ cwd = (Get-Location).Path; line = $whole; log = $log; env = $environment }
+  Write-Shared $jobFile ($job | ConvertTo-Json -Depth 3 -Compress)
+  $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+  $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSScriptRoot\detached.ps1`" `"$jobFile`""
+  $made = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $command; CurrentDirectory = (Get-Location).Path; ProcessStartupInformation = $startup }
+  if ($made.ReturnValue -ne 0)
+  {
+    Remove-Item -LiteralPath $jobFile -Force -ErrorAction SilentlyContinue
+    [Console]::Error.WriteLine("heavy: could not start the detached job (Win32_Process.Create returned $($made.ReturnValue)).")
+    exit 1
+  }
+  "heavy: detached (pid $($made.ProcessId)): $whole"
+  "heavy: output in $log; when the job ends, $log.exit holds its exit code."
+  exit 0
+}
 
 # A job that travelled here (machine\worker.ps1 claimed it): its home's offer gives the command line, the
 # folder, the environment and what to show; its output and exit code go back through the home's travel
