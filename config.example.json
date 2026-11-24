@@ -1,0 +1,8 @@
+{
+  "root": "D:\\heavy-queue-data",
+  "holdFile": "D:\\heavy-queue-data\\hold.txt",
+  "quietFlag": "D:\\heavy-queue-data\\quiet.flag",
+  "mutex": "Global\\heavy-queue",
+  "heldVariable": "MY_SCRIPTS_HEAVY_HELD",
+  "title": "BUILDBOX heavy slot"
+}

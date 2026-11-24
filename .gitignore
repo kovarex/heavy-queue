@@ -1,0 +1,7 @@
+build/
+*.cgi
+password
+control-password
+publish.txt
+config.json
+deploy/site.txt

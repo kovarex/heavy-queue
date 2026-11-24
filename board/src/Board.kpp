@@ -1,0 +1,340 @@
+// heavyboard: shows the heavy slots of several machines on one public page, as a CGI program.
+//   GET  index.cgi                         the page; it reads ?json every 5 s and draws the tables
+//   GET  index.cgi?json                    every machine: whether it is open, and its last status
+//   POST index.cgi?update&machine=NAME     a machine's new status: a JSON object, with the header X-Heavy-Password
+//   GET  index.cgi?state&machine=NAME      what the machine's gate asks: open, closed or stopped
+//   POST index.cgi?open=1|0|hard&machine=NAME   the page's buttons, with the control password
+//   POST index.cgi?page                    a new page (HTML), with the posting password
+// The data directory (HEAVYBOARD_DATA, else /home/protected/heavyboard: on NearlyFreeSpeech, a directory
+// the web cannot read) holds `password` (its first line), `control-password`, `always-open` (machines open
+// unless closed, without buttons: one name a line) and each machine's status-NAME.json, which an update
+// replaces whole (a new file renamed over the old one).
+
+constexpr i64 boardMaxUpdateBytes = 1024 * 1024;
+
+struct BoardError
+{
+  i32 status;
+  std::String message;
+};
+
+std::String boardDataDirectory()
+{
+  const char* value = std::getenv("HEAVYBOARD_DATA");
+  return value != nullptr && value[0] != 0 ? std::String(value) : std::String("/home/protected/heavyboard");
+}
+
+bool boardReadFile(const std::String& path, std::String& text)
+{
+  FILE* file = fopen(path.c_str(), "rb");
+  if (!file)
+    return false;
+  char buffer[65536];
+  while (true)
+  {
+    usize n = fread(buffer, 1, 65536, file);
+    if (n == 0)
+      break;
+    text << std::StringView(buffer, n);
+  }
+  fclose(file);
+  return true;
+}
+
+void boardWriteFile(const std::String& path, std::StringView content)
+{
+  std::String temporary = path + ".new";
+  FILE* file = fopen(temporary.c_str(), "wb");
+  if (!file)
+    throw BoardError{500, std::toString("cannot write ", temporary)};
+  bool written = fwrite(content.data(), 1, content.size(), file) == usize(content.size());
+  if (fclose(file) != 0 || !written)
+    throw BoardError{500, std::toString("cannot write ", temporary)};
+  std::filesystem::rename(std::filesystem::path(temporary), std::filesystem::path(path));
+}
+
+// The password's first line, without the line break and trailing spaces; empty when there is none.
+std::String boardPassword(const std::String& directory, std::StringView file)
+{
+  std::String text;
+  if (!boardReadFile(directory + "/" + file, text))
+    return std::String();
+  i32 end = 0;
+  while (end < text.size() && text[end] != '\n' && text[end] != '\r')
+    ++end;
+  while (end > 0 && (text[end - 1] == ' ' || text[end - 1] == '\t'))
+    --end;
+  return std::String(std::StringView(text).substr(0, end));
+}
+
+// Compares in a time that does not depend on where they differ.
+bool boardSame(std::StringView a, std::StringView b)
+{
+  u32 difference = a.size() == b.size() ? 0u : 1u;
+  for (i32 i = 0; i < a.size(); ++i)
+    difference |= u32(u8(a[i])) ^ u32(u8(i < b.size() ? b[i] : 0));
+  return difference == 0;
+}
+
+void boardCheckPassword(const http::HttpRequest& request, const std::String& directory, std::StringView file = "password")
+{
+  if (request.method != "POST")
+    throw BoardError{405, "an update is a POST"};
+  std::String password = boardPassword(directory, file);
+  if (password.empty())
+    throw BoardError{503, "no password is set"};
+  const std::String* given = request.header("x-heavy-password");
+  if (given == nullptr || !boardSame(*given, password))
+    throw BoardError{403, "wrong password"};
+}
+
+// The machine a request is about: ?machine=NAME (letters, digits, '-', up to 32, made upper case).
+std::String boardMachine(const http::HttpRequest& request)
+{
+  const std::String* given = request.parameter("machine");
+  if (given == nullptr || given->empty())
+    throw BoardError{400, "which machine: ?machine=NAME"};
+  if (given->size() > 32)
+    throw BoardError{400, "a machine's name is up to 32 characters"};
+  std::String name;
+  for (char c : *given)
+  {
+    if (c >= 'a' && c <= 'z')
+      name << char(c - 'a' + 'A');
+    else if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-')
+      name << c;
+    else
+      throw BoardError{400, "a machine's name is letters, digits and '-'"};
+  }
+  return name;
+}
+
+// The machines in `always-open`, one name a line, made upper case.
+std::Vector<std::String> boardAlwaysOpen(const std::String& directory)
+{
+  std::Vector<std::String> names;
+  std::String text;
+  if (!boardReadFile(directory + "/always-open", text))
+    return names;
+  std::String name;
+  for (i32 i = 0; i <= text.size(); ++i)
+  {
+    char c = i < text.size() ? text[i] : '\n';
+    if (c == '\n' || c == '\r')
+    {
+      if (!name.empty() && std::find(names.begin(), names.end(), name) == names.end())
+        names.push_back(name);
+      name = std::String();
+    }
+    else if (c != ' ' && c != '\t')
+      name << (c >= 'a' && c <= 'z' ? char(c - 'a' + 'A') : c);
+  }
+  return names;
+}
+
+// A machine's state, set by the page's buttons into open-NAME (a soft and a hard stop): "open" takes heavy
+// jobs; "closed" starts no new one and lets the running one finish; "stopped" also stops the running one
+// at once. A machine in always-open is open unless closed; another machine is closed unless opened.
+std::String boardState(const std::String& directory, const std::String& machine)
+{
+  std::String text;
+  if (!boardReadFile(directory + "/open-" + machine, text) || text.empty())
+  {
+    std::Vector<std::String> always = boardAlwaysOpen(directory);
+    return std::String(std::find(always.begin(), always.end(), machine) != always.end() ? "open" : "closed");
+  }
+  if (text.startsWith("hard"))
+    return std::String("stopped");
+  return std::String(text[0] == '1' ? "open" : "closed");
+}
+
+// The buttons' password: control-password, the owner's, not the machines' posting password. Guessing is locked out: after 5 wrong ones in 10
+// minutes (control-failures, their times) every control request gets 429 until the 10 minutes pass.
+constexpr i32 boardControlFailures = 5;
+constexpr i64 boardControlWindowSeconds = 600;
+
+void boardCheckControl(const http::HttpRequest& request, const std::String& directory)
+{
+  i64 now = i64(time(nullptr));
+  std::Vector<i64> recent;
+  std::String text;
+  if (boardReadFile(directory + "/control-failures", text))
+  {
+    i64 value = 0;
+    bool any = false;
+    for (char c : text)
+    {
+      if (c >= '0' && c <= '9') { value = value * 10 + (c - '0'); any = true; }
+      else if (any) { if (now - value < boardControlWindowSeconds) recent.push_back(value); value = 0; any = false; }
+    }
+    if (any && now - value < boardControlWindowSeconds)
+      recent.push_back(value);
+  }
+  if (recent.size() >= boardControlFailures)
+    throw BoardError{429, "too many wrong passwords: wait 10 minutes"};
+  try
+  {
+    boardCheckPassword(request, directory, "control-password");
+  }
+  catch (const BoardError& error)
+  {
+    if (error.status == 403)
+    {
+      recent.push_back(now);
+      std::String out;
+      for (i64 t : recent)
+        out << std::toString(t) << "\n";
+      boardWriteFile(directory + "/control-failures", out);
+    }
+    throw;
+  }
+}
+
+void boardUpdate(const http::HttpRequest& request, http::HttpResponse& response, const std::String& directory)
+{
+  boardCheckPassword(request, directory);
+  if (request.body.size() > boardMaxUpdateBytes)
+    throw BoardError{413, "the status is too large"};
+  json::JsonValue status;
+  json::JsonParseError error;
+  if (!json::tryParseJson(request.body, status, &error))
+    throw BoardError{400, std::toString("not JSON: ", error.what())};
+  if (!status.isObject())
+    throw BoardError{400, "the status is not a JSON object"};
+  boardWriteFile(directory + "/status-" + boardMachine(request) + ".json", json::writeJson(status));
+  response.status = 204;
+  response.body = std::String();
+}
+
+void boardHandleIn(const http::HttpRequest& request, http::HttpResponse& response, const std::String& directory)
+{
+  response.setHeader("Cache-Control", "no-store");
+  try
+  {
+    if (request.parameter("update") != nullptr)
+    {
+      boardUpdate(request, response, directory);
+      return;
+    }
+    if (request.parameter("page") != nullptr)
+    {
+      // A new page (HTML), so the page changes without a new program: page.html replaces the built-in one.
+      boardCheckPassword(request, directory);
+      if (request.body.size() > boardMaxUpdateBytes)
+        throw BoardError{413, "the page is too large"};
+      boardWriteFile(directory + "/page.html", request.body);
+      response.status = 204;
+      response.body = std::String();
+      return;
+    }
+    if (request.parameter("open") != nullptr)
+    {
+      // The page's buttons for ?machine=NAME: ?open=1 opens, ?open=0 closes (the running job finishes),
+      // ?open=hard closes and stops the running job.
+      boardCheckControl(request, directory);
+      std::String machine = boardMachine(request);
+      const std::String& value = *request.parameter("open");
+      if (value != "1" && value != "0" && value != "hard")
+        throw BoardError{400, "open is 1, 0 or hard"};
+      boardWriteFile(directory + "/open-" + machine, value + "\n");
+      response.status = 204;
+      response.body = std::String();
+      return;
+    }
+    if (request.parameter("login") != nullptr)
+    {
+      // The page's control form (a real form, so Firefox offers to save the password): checks the control
+      // password from the form's field, as the buttons' header does.
+      http::HttpRequest checked = request;
+      for (const url::UrlQueryParameter& field : request.form())
+        if (field.name == "password")
+          checked.headers.push_back(http::HttpHeader{"x-heavy-password", field.value});
+      // Answered into the page's hidden frame, which tells the page: "heavy-login:ok", "bad" or "locked".
+      std::String result = "ok";
+      try { boardCheckControl(checked, directory); }
+      catch (const BoardError& error) { result = error.status == 429 ? "locked" : "bad"; }
+      response.body = std::toString("<!doctype html><script>parent.postMessage('heavy-login:", result, "', '*');</script>");
+      return;
+    }
+    if (request.parameter("state") != nullptr)
+    {
+      // What a machine's poller asks: "open", "closed" or "stopped". The asking also lists the machine
+      // (seen-NAME holds when it last asked), so a machine shows on the page before its first job.
+      std::String machine = boardMachine(request);
+      const std::String* now = request.parameter("now");
+      const std::String* role = request.parameter("role");
+      boardWriteFile(directory + "/seen-" + machine, (now != nullptr ? *now : std::String()) + "\n" + (role != nullptr && *role == "builds" ? "builds\n" : ""));
+      response.setHeader("Content-Type", "text/plain; charset=utf-8");
+      response.body = boardState(directory, machine) + "\n";
+      return;
+    }
+    if (request.parameter("json") != nullptr)
+    {
+      // Every machine: the always-open ones, then any other that asked for its state or posted a status, each
+      // with whether it is open and its last status.
+      std::Vector<std::String> always = boardAlwaysOpen(directory);
+      std::Vector<std::String> names = always;
+      for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(std::filesystem::path(directory)))
+      {
+        std::String file = entry.path().filename().string();
+        std::String name;
+        if (file.startsWith("status-") && file.endsWith(".json"))
+          name = std::String(std::StringView(file).substr(7, file.size() - 12));
+        else if (file.startsWith("seen-"))
+          name = std::String(std::StringView(file).substr(5));
+        if (!name.empty())
+        {
+          if (std::find(names.begin(), names.end(), name) == names.end())
+            names.push_back(name);
+        }
+      }
+      json::JsonValue machines = json::JsonValue::array();
+      for (const std::String& name : names)
+      {
+        json::JsonValue machine = json::JsonValue::object();
+        machine.set("name", name);
+        std::String state = boardState(directory, name);
+        machine.set("open", state == "open");
+        machine.set("state", state);
+        if (std::find(always.begin(), always.end(), name) != always.end())
+          machine.set("fixed", true); // (no buttons on the page)
+        std::String seen;
+        if (boardReadFile(directory + "/seen-" + name, seen) && !seen.empty() && seen[0] != '\n')
+          machine.set("seen", std::String(std::StringView(seen).substr(0, seen.find('\n'))));
+        if (seen.find("\nbuilds") != std::String::npos)
+          machine.set("role", "builds"); // a machine that runs no benchmarks
+        std::String text;
+        json::JsonValue status;
+        if (boardReadFile(directory + "/status-" + name + ".json", text) && json::tryParseJson(text, status))
+          machine.set("status", status);
+        machines.push(machine);
+      }
+      json::JsonValue all = json::JsonValue::object();
+      all.set("machines", machines);
+      response.setHeader("Content-Type", "application/json; charset=utf-8");
+      response.body = json::writeJson(all);
+      return;
+    }
+    std::String page;
+    response.body = boardReadFile(directory + "/page.html", page) ? page : std::String(boardPage);
+  }
+  catch (const BoardError& error)
+  {
+    response.status = error.status;
+    response.setHeader("Content-Type", "text/plain; charset=utf-8");
+    response.body = error.message + "\n";
+  }
+}
+
+void boardHandle(const http::HttpRequest& request, http::HttpResponse& response) { boardHandleIn(request, response, boardDataDirectory()); }
+
+int main()
+{
+  if (std::getenv("REQUEST_METHOD") != nullptr)
+    return http::httpCgi(boardHandle);
+  // On one's own machine: http://127.0.0.1:8765/ (HEAVYBOARD_DATA names the data directory).
+  http::HttpServerOptions options;
+  options.port = 8765;
+  http::httpServe(options, boardHandle);
+  return 0;
+}

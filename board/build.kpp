@@ -1,0 +1,9 @@
+﻿// heavyboard: the board that shows every machine's heavy slot (README.md). `kpp` here builds it, `kpp --test`
+// runs its tests, `kpp --release --target freebsd heavyboard` builds a CGI program for a FreeBSD host.
+void build(Project& project)
+{
+  Executable& board = project.executable("heavyboard", {"src"});
+  board.argument("--this-reference"); // `this` is the object, written `this.x` and `&this`
+  for (std::StringView name : {"http", "json", "net", "url"})
+    board.use(name);
+}

@@ -1,0 +1,112 @@
+// The page: static; its script reads ?json every 5 seconds and draws each machine (open or closed, with
+// an Open / Close button for the ones that take a button), then the jobs running now, the queues and the
+// finished jobs of all machines together, each row naming its machine. Running times are counted in the
+// browser (the times the machines post carry their UTC offset). The button asks for the password once
+// and keeps it in this browser.
+constexpr std::StringView boardPage = R"(<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>heavy slot</title>
+<style>
+:root { --bg: #fff; --fg: #1a1a1a; --muted: #666; --line: #ddd; --head: #f3f3f3; --ok: #1a7f37; --bad: #c62828; --ex: #8250df; --hv: #0969da; --card: #f7f7f7; }
+@media (prefers-color-scheme: dark) { :root { --bg: #161616; --fg: #e6e6e6; --muted: #999; --line: #333; --head: #222; --ok: #4ac26b; --bad: #ff6b6b; --ex: #b392f0; --hv: #58a6ff; --card: #1f1f1f; } }
+body { background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; margin: 16px; }
+h1 { font-size: 18px; margin: 0 0 4px; } h2 { font-size: 15px; margin: 20px 0 6px; }
+.muted, .none { color: var(--muted); } .wrap { overflow-x: auto; } table { border-collapse: collapse; width: 100%; }
+th, td { border-bottom: 1px solid var(--line); padding: 4px 8px; text-align: left; vertical-align: top; }
+th { background: var(--head); font-weight: 600; } td.cmd { font-family: Consolas, monospace; font-size: 12px; word-break: break-all; }
+.exclusive { color: var(--ex); font-weight: 600; } .heavy { color: var(--hv); } .ok { color: var(--ok); } .bad { color: var(--bad); font-weight: 600; }
+.machines { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+.machine { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; min-width: 220px; }
+.machine b { font-size: 15px; } .state { font-weight: 600; margin-left: 8px; } .state.open { color: var(--ok); } .state.closed { color: var(--bad); }
+button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; margin-top: 8px; }
+</style></head><body>
+<h1>Heavy jobs</h1>
+<div class="muted"><span id="written">loading...</span> <span id="control"></span></div>
+<form id="login" method="post" action="?login" target="loginFrame" style="display: none; margin-top: 8px;">
+<input type="text" name="username" value="heavy control" autocomplete="username" readonly style="display: none;">
+<input id="loginPassword" type="password" name="password" autocomplete="current-password" placeholder="control password">
+<button type="submit">Unlock</button>
+</form>
+<iframe name="loginFrame" style="display: none;"></iframe>
+<div class="machines" id="machines"></div>
+<h2>Running</h2>
+<div class="wrap"><table><thead><tr><th>machine</th><th>kind</th><th>thread</th><th>command</th><th>started</th><th>running</th><th>estimate</th><th>done</th></tr></thead><tbody id="running"></tbody></table></div>
+<h2>Waiting</h2>
+<div class="wrap"><table><thead><tr><th>machine</th><th>#</th><th>kind</th><th>thread</th><th>command</th><th>queued</th><th>waiting</th><th>estimate</th><th>runs</th></tr></thead><tbody id="queue"></tbody></table></div>
+<h2>Finished</h2>
+<div class="wrap"><table><thead><tr><th>machine</th><th>kind</th><th>thread</th><th>command</th><th>started</th><th>waited</th><th>took</th><th>exit</th></tr></thead><tbody id="finished"></tbody></table></div>
+<script>
+function d(s) { s = Math.max(0, Math.floor(s)); var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+  return h ? h + 'h ' + String(m).padStart(2, '0') + 'm' : m ? m + 'm ' + String(x).padStart(2, '0') + 's' : x + 's'; }
+function t(iso, withDay) { var v = new Date(iso); if (isNaN(v)) return ''; var two = function (n) { return String(n).padStart(2, '0'); };
+  return (withDay ? two(v.getMonth() + 1) + '-' + two(v.getDate()) + ' ' : '') + two(v.getHours()) + ':' + two(v.getMinutes()) + ':' + two(v.getSeconds()); }
+// Estimates (the lock's: what the job gave, else similar finished jobs; its basis in brackets). A machine's
+// line is counted from now: the running job ends at its start plus its estimate (or now, once over it),
+// each waiting job starts when the one before it ends. Unknown after a job without one, or while closed.
+function est(j) { return j.estimate == null ? '' : d(j.estimate) + ' (' + (j.basis || '?') + ')'; }
+function hm(ms) { var v = new Date(ms), two = function (n) { return String(n).padStart(2, '0'); };
+  return '~' + (new Date().toDateString() === v.toDateString() ? '' : two(v.getMonth() + 1) + '-' + two(v.getDate()) + ' ') + two(v.getHours()) + ':' + two(v.getMinutes()); }
+function cell(row, text, cls) { var c = row.insertCell(); c.textContent = text == null ? '' : String(text); if (cls) c.className = cls; return c; }
+function none(body, columns, text) { var r = body.insertRow(); var c = cell(r, text, 'none'); c.colSpan = columns; }
+function password() { try { return localStorage.getItem('heavyControl'); } catch (e) { return null; } }
+function unlock() { var f = document.getElementById('login'); f.style.display = f.style.display === 'none' ? 'block' : 'none'; if (f.style.display === 'block') document.getElementById('loginPassword').focus(); }
+var typed = '';
+document.addEventListener('submit', function (e) { if (e.target.id === 'login') typed = document.getElementById('loginPassword').value; });
+window.addEventListener('message', function (e) { if (typeof e.data !== 'string' || e.data.indexOf('heavy-login:') !== 0) return;
+  var result = e.data.substring(12);
+  if (result === 'ok') { try { localStorage.setItem('heavyControl', typed); } catch (x) {} document.getElementById('login').style.display = 'none'; load(); }
+  else alert(result === 'locked' ? 'Too many wrong passwords: control is locked for 10 minutes.' : 'Wrong control password.'); });
+function lock() { try { localStorage.removeItem('heavyControl'); } catch (e) {} load(); }
+function setOpen(name, value) { var p = password(); if (!p) return;
+  fetch('?open=' + value + '&machine=' + encodeURIComponent(name), { method: 'POST', headers: { 'X-Heavy-Password': p } })
+    .then(function (r) { if (r.status === 403) { lock(); alert('Wrong control password.'); } else if (r.status === 429) alert('Too many wrong passwords: control is locked for 10 minutes.'); else if (!r.ok) alert('Failed: ' + r.status); load(); }); }
+function draw(all) {
+  var machines = all.machines || [], cards = document.getElementById('machines'); cards.innerHTML = '';
+  var running = document.getElementById('running'), queue = document.getElementById('queue'), finished = document.getElementById('finished');
+  running.innerHTML = ''; queue.innerHTML = ''; finished.innerHTML = '';
+  var latest = '', ended = [];
+  machines.forEach(function (m) {
+    var s = m.status || {};
+    if (s.written && s.written > latest) latest = s.written;
+    var card = document.createElement('div'); card.className = 'machine';
+    var title = document.createElement('b'); title.textContent = m.name; card.appendChild(title);
+    if (m.role === 'builds') { var role = document.createElement('span'); role.className = 'muted'; role.textContent = ' builds only, no benchmarks'; card.appendChild(role); }
+    var st = m.state || (m.open ? 'open' : 'closed'); var state = document.createElement('span'); state.className = 'state ' + (m.open ? 'open' : 'closed'); state.textContent = st === 'stopped' ? 'closed (job stopped)' : st; card.appendChild(state);
+    var line = document.createElement('div'); line.className = 'muted';
+    line.textContent = s.running ? 'running: ' + (s.running.thread || s.running.folder) : (s.written ? 'idle' : 'no job yet');
+    if (m.seen) { var ago = (Date.now() - new Date(m.seen)) / 1000; if (!isNaN(ago)) line.textContent += ago > 90 ? ' (offline? last seen ' + d(ago) + ' ago)' : ''; }
+    card.appendChild(line);
+    if (!m.fixed && password()) {
+      var add = function (text, value, title) { var b = document.createElement('button'); b.textContent = text; b.title = title; b.style.marginRight = '6px';
+        b.onclick = function () { setOpen(m.name, value); }; card.appendChild(b); };
+      if (m.open) { add('Close', '0', 'Start nothing new; the running job finishes'); add('Close now', 'hard', 'Start nothing new and stop the running job'); }
+      else { add('Open', '1', 'Take heavy jobs'); if (st === 'closed' && s.running) add('Stop job now', 'hard', 'Stop the running job too'); } }
+    cards.appendChild(card);
+    var next = m.open ? Date.now() : null;
+    if (s.running) { var r = running.insertRow(); cell(r, m.name); cell(r, s.running.kind, s.running.kind); cell(r, s.running.thread || s.running.folder); cell(r, s.running.label, 'cmd'); cell(r, t(s.running.since));
+      cell(r, '').dataset.since = s.running.since; cell(r, est(s.running));
+      if (s.running.estimate == null) { cell(r, ''); next = null; }
+      else { var end = new Date(s.running.since).getTime() + s.running.estimate * 1000;
+        cell(r, end < Date.now() ? 'over by ' + d((Date.now() - end) / 1000) : hm(end)); if (next != null) next = Math.max(next, end); } }
+    (s.queue || []).forEach(function (q, i) { var r = queue.insertRow(); cell(r, m.name); cell(r, i + 1); cell(r, q.kind, q.kind); cell(r, q.thread || q.folder); cell(r, q.label, 'cmd'); cell(r, t(q.since));
+      cell(r, '').dataset.since = q.since; cell(r, est(q));
+      if (next == null) cell(r, m.open ? '' : 'machine closed', 'muted');
+      else { var from = next; next = q.estimate == null ? null : next + q.estimate * 1000; cell(r, hm(from) + (next == null ? '' : ' - ' + hm(next))); } });
+    (s.finished || []).forEach(function (f) { f.machine = m.name; ended.push(f); });
+  });
+  if (!running.rows.length) none(running, 8, 'nothing running');
+  if (!queue.rows.length) none(queue, 9, 'nobody waiting');
+  ended.sort(function (a, b) { return new Date(b.ended) - new Date(a.ended); });
+  ended.slice(0, 200).forEach(function (f) { var r = finished.insertRow(); cell(r, f.machine); cell(r, f.kind, f.kind); cell(r, f.thread || f.folder); cell(r, f.label, 'cmd'); cell(r, t(f.started, true));
+    cell(r, d((new Date(f.started) - new Date(f.queued)) / 1000)); cell(r, d((new Date(f.ended) - new Date(f.started)) / 1000)); cell(r, f.exit, f.exit === 0 ? 'ok' : 'bad'); });
+  if (!ended.length) none(finished, 8, 'none yet');
+  document.getElementById('control').innerHTML = password() ? '<a href="#" onclick="lock(); return false;">lock control</a>' : '<a href="#" onclick="unlock(); return false;">control</a>';
+  document.getElementById('written').textContent = latest ? 'Last posted ' + t(latest, true) + ' (your local time). Reloads every 5 s.' : 'Nothing posted yet.';
+  tick(); }
+function tick() { document.querySelectorAll('[data-since]').forEach(function (e) { e.textContent = d((Date.now() - new Date(e.dataset.since)) / 1000); }); }
+function load() { fetch('?json', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(draw)
+  .catch(function () { document.getElementById('written').textContent = 'Could not read the status.'; }); }
+load(); setInterval(load, 5000); setInterval(tick, 1000);
+</script>
+</body></html>
+)";
