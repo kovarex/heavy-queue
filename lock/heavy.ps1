@@ -12,14 +12,8 @@
 # also waits while the hold file's line 1 is not "HOLD: no" or a quiet flag whose holder is alive exists,
 # and an --exclusive job holds that flag while it runs. The exit code is the command's.
 #
-# config.json in the repository's root (not in the repository; HEAVY_QUEUE_CONFIG names another file)
-# says where things are; each setting has a default:
-#   root          the data folder (queue, holder.txt, history.tsv, status.*, publish.txt)  %ProgramData%\heavy-queue
-#   holdFile      line 1 "HOLD: no" lets jobs start, anything else holds them             ROOT\hold.txt
-#   quietFlag     the flag an --exclusive job holds, and every job waits for              ROOT\quiet.flag
-#   mutex         the slot's name                                                         Global\heavy-queue
-#   heldVariable  one more variable set for the command, for scripts that check their own (none)
-#   title         the status page's heading                                               COMPUTERNAME heavy slot
+# config.json in the repository's root (kept out of git; HEAVY_QUEUE_CONFIG names another file) says where
+# things are (lock\config.ps1 reads it; lock\README.md lists the settings and their defaults).
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'config.ps1')
 $queueDir = Join-Path $root 'queue'
@@ -75,10 +69,12 @@ function MdText([string]$text) { return ($text -replace '`', "'" -replace '\|', 
 
 function Owner([string]$thread, [string]$cwd) { if ($thread) { return $thread } return (Who $cwd) }
 
-# The title of the Claude session (the thread) that started this job, from the desktop app's record of
-# it (CLAUDE_CODE_HOST_SESSION_ID); empty outside one. ':' is written '-' (the records use ': ').
+# Who started this job (the page's thread column): HEAVY_QUEUE_THREAD when set; else, inside a Claude Code
+# session of the desktop app, that session's title (CLAUDE_CODE_HOST_SESSION_ID and the app's record of
+# it); else empty, and the page names the job's folder. ':' is written '-' (the records use ': ').
 function Thread-Title
 {
+  if ($env:HEAVY_QUEUE_THREAD) { return ($env:HEAVY_QUEUE_THREAD -replace '[:\t\r\n]', '-') }
   $id = $env:CLAUDE_CODE_HOST_SESSION_ID
   if (-not $id) { return '' }
   try
@@ -92,9 +88,10 @@ function Thread-Title
   return ''
 }
 
+# A folder as the page shows it: a Claude Code worktree's name, else its last two parts.
 function Who([string]$cwd)
 {
-  if ($cwd -match 'worktrees\\([^\\]+)') { return $matches[1] }
+  if ($cwd -match '\\\.claude\\worktrees\\([^\\]+)') { return $matches[1] }
   $parts = @($cwd.TrimEnd('\') -split '\\')
   if ($parts.Count -ge 2) { return $parts[-2] + '\' + $parts[-1] }
   return $cwd
@@ -112,17 +109,22 @@ function Parse-Record([string]$text)
 }
 
 # Time estimates. A job's estimate is, in this order: what it gave with --estimate; else the median of
-# the last 5 successful runs with the same name (the label in lower case, without a Claude Code worktree's path,
-# digits counted as one, its first three words); else of the last 5 successful jobs of the same thread;
-# else of the last 5 of the same kind. Tried on a first machine's 221 finished jobs: within 2x for 86%
-# of the jobs matched by name, 46% of those matched only by thread. history.tsv's ninth column is the estimate a job
-# had when it started (with its basis), to see how good they are.
+# the last 5 successful runs with the same name; else of the last 5 successful jobs of the same thread;
+# else of the last 5 successful jobs of the same kind. A name is the label's first three words in lower
+# case, a path among them cut to its last two parts and every number counted alike, so the same script
+# from another folder, or another numbered run, is the same job. Tried on a first machine's 223 finished
+# jobs: within 2x for 88% of the jobs matched by name, 50% of those matched only by thread. history.tsv's
+# ninth column is the estimate a job had when it started (with its basis), to see how good they are.
 function Estimate-Key([string]$label)
 {
-  $l = $label.ToLowerInvariant().Trim('"', ' ')
-  $l = $l -replace '[a-z]:\\[^ ]*?\\\.claude\\worktrees\\[^\\ ]+\\', ''
-  $l = $l -replace '\d+', '#'
-  return (@($l -split '\s+' | Where-Object { $_ }) | Select-Object -First 3) -join ' '
+  $words = foreach ($w in @($label.ToLowerInvariant() -split '\s+' | Where-Object { $_ } | Select-Object -First 3))
+  {
+    $w = $w.Trim('"', "'")
+    $parts = @($w -split '[\\/]' | Where-Object { $_ })
+    if ($parts.Count -ge 2) { $w = $parts[-2] + '\' + $parts[-1] }
+    $w -replace '\d+', '#'
+  }
+  return @($words) -join ' '
 }
 
 function Parse-Seconds([string]$text)
@@ -140,7 +142,7 @@ $script:estimator = $null
 function Load-Estimator
 {
   $byName = @{}; $byThread = @{}; $byKind = @{}
-  foreach ($l in @(Get-Content $historyFile -ErrorAction SilentlyContinue))
+  foreach ($l in @(Get-Content $historyFile -Tail 3000 -ErrorAction SilentlyContinue)) # (the recent past is enough, and keeps each page write quick)
   {
     $f = $l.TrimStart([char]0xFEFF) -split "`t"
     if ($f.Count -lt 7 -or $f[3] -ne '0') { continue }
@@ -186,6 +188,22 @@ function Duration([TimeSpan]$t)
   return '{0}s' -f [int]$t.TotalSeconds
 }
 
+# What holds the line besides the slot itself, or '': the hold file's line 1 when it is not "HOLD: no", or
+# the quiet flag while its holder lives. The flag of the job running now (an --exclusive job holds it) does
+# not count when that job's pid is given: it holds the slot anyway.
+function Hold-Reason([int]$runningPid = 0)
+{
+  $first = Get-Content $schedule -TotalCount 1 -ErrorAction SilentlyContinue
+  if ($first -and $first.Trim() -ne 'HOLD: no') { return "$(Split-Path -Leaf $schedule) line 1 is '$($first.Trim())'" }
+  if (Test-Path $flag)
+  {
+    $text = (Get-Content -Raw $flag -ErrorAction SilentlyContinue) + ''
+    if ($text -match 'heavy pid (\d+)' -and (([int]$matches[1] -eq $runningPid) -or -not (Alive ([int]$matches[1])))) { return '' }
+    return "$(Split-Path -Leaf $flag) exists"
+  }
+  return ''
+}
+
 function Write-Page
 {
   try
@@ -195,12 +213,14 @@ function Write-Page
     $now = Get-Date
     $script:estimator = $null
     # When the next job could start: now, or when the running job's estimate runs out (unknown once a job
-    # in the line has no estimate). The machine's holds and an exclusive job's idle wait are not counted.
+    # in the line has no estimate, or while the line is held). An exclusive job's idle wait is not counted.
     $next = $now
     $rows = New-Object System.Text.StringBuilder
     $holder = $null
     if (Test-Path $holderFile) { $holder = Parse-Record ((Get-Content -Raw $holderFile -ErrorAction SilentlyContinue) + '').Trim() }
-    if ($holder -and (Alive $holder.Pid))
+    $running = $holder -and (Alive $holder.Pid)
+    $heldWhy = Hold-Reason $(if ($running) { $holder.Pid } else { 0 })
+    if ($running)
     {
       $iso = $holder.Since.ToString('s')
       $e = Estimate $holder
@@ -219,6 +239,7 @@ function Write-Page
       [void]$md.Append("| $($holder.Kind) | $(Owner $holder.Thread $holder.Cwd) | ``$(MdText $holder.Label)`` | $($holder.Since.ToString('HH:mm')) | $(Duration ($now - $holder.Since)) | $estText | $doneText |`n")
     }
     else { [void]$rows.Append("<tr><td colspan='8' class='none'>free</td></tr>"); [void]$md.Append("| free | | | | | | |`n") }
+    if ($heldWhy) { $next = $null }
     $mdQueue = New-Object System.Text.StringBuilder
     $queue = New-Object System.Text.StringBuilder
     $n = 0
@@ -236,6 +257,7 @@ function Write-Page
         $job.starts = (Iso $next); $startText = '~' + (Short-Time $next)
         if ($e) { $next = $next.AddSeconds($e.seconds); $job.done = (Iso $next); $startText += ' - ~' + (Short-Time $next) } else { $next = $null }
       }
+      elseif ($heldWhy) { $startText = 'held' }
       [void]$jQueue.Add($job)
       [void]$queue.Append("<tr><td>$n</td><td class='kind $($r.Kind)'>$($r.Kind)</td><td>$(Html (Owner $r.Thread $r.Cwd))</td><td class='cmd'>$(Html $r.Label)</td><td>$($r.Since.ToString('HH:mm:ss'))</td><td class='run' data-since='$($r.Since.ToString('s'))'></td><td>$estText</td><td>$startText</td></tr>")
       [void]$mdQueue.Append("| $n | $($r.Kind) | $(Owner $r.Thread $r.Cwd) | ``$(MdText $r.Label)`` | $($r.Since.ToString('HH:mm')) | $(Duration ($now - $r.Since)) | $estText | $startText |`n")
@@ -247,16 +269,23 @@ function Write-Page
     [array]::Reverse($lines)
     foreach ($l in $lines)
     {
-      # queued, started, finished (ISO), exit code, kind, cwd, label
-      $f = $l -split "`t"
+      # queued, started, finished (ISO), exit code, kind, cwd, label, thread, estimate at its start ("SECONDS BASIS")
+      $f = $l.TrimStart([char]0xFEFF) -split "`t"
       if ($f.Count -lt 7) { continue }
       $owner = if ($f.Count -ge 8) { Owner $f[7] $f[5] } else { Who $f[5] }; $queued = [DateTime]$f[0]; $started = [DateTime]$f[1]; $ended = [DateTime]$f[2]
       $ok = if ($f[3] -eq '0') { 'ok' } else { 'bad' }
-      if ($jFinished.Count -lt 100) { [void]$jFinished.Add([ordered]@{ kind = $f[4]; thread = $owner; folder = (Who $f[5]); label = $f[6]; queued = (Iso $queued); started = (Iso $started); ended = (Iso $ended); exit = [int]$f[3] }) }
-      [void]$history.Append("<tr><td class='kind $($f[4])'>$($f[4])</td><td>$(Html $owner)</td><td class='cmd'>$(Html $f[6])</td><td>$($started.ToString('MM-dd HH:mm'))</td><td>$(Duration ($started - $queued))</td><td>$(Duration ($ended - $started))</td><td class='$ok'>$($f[3])</td></tr>")
-      if ($mdHistory.Length -lt 20000) { [void]$mdHistory.Append("| $($f[4]) | $owner | ``$(MdText $f[6])`` | $($started.ToString('MM-dd HH:mm')) | $(Duration ($started - $queued)) | $(Duration ($ended - $started)) | $(if ($f[3] -eq '0') { '0' } else { '**' + $f[3] + '**' }) |`n") }
+      $guess = $null; $guessBasis = ''; $guessText = ''
+      if ($f.Count -ge 9 -and $f[8] -match '^(\d+) (\w+)$') { $guess = [int]$matches[1]; $guessBasis = $matches[2]; $guessText = (Duration ([TimeSpan]::FromSeconds($guess))) + " ($guessBasis)" }
+      if ($jFinished.Count -lt 100)
+      {
+        $job = [ordered]@{ kind = $f[4]; thread = $owner; folder = (Who $f[5]); label = $f[6]; queued = (Iso $queued); started = (Iso $started); ended = (Iso $ended); exit = [int]$f[3] }
+        if ($null -ne $guess) { $job.estimate = $guess; $job.basis = $guessBasis }
+        [void]$jFinished.Add($job)
+      }
+      [void]$history.Append("<tr><td class='kind $($f[4])'>$($f[4])</td><td>$(Html $owner)</td><td class='cmd'>$(Html $f[6])</td><td>$($started.ToString('MM-dd HH:mm'))</td><td>$(Duration ($started - $queued))</td><td>$(Duration ($ended - $started))</td><td>$guessText</td><td class='$ok'>$($f[3])</td></tr>")
+      if ($mdHistory.Length -lt 20000) { [void]$mdHistory.Append("| $($f[4]) | $owner | ``$(MdText $f[6])`` | $($started.ToString('MM-dd HH:mm')) | $(Duration ($started - $queued)) | $(Duration ($ended - $started)) | $guessText | $(if ($f[3] -eq '0') { '0' } else { '**' + $f[3] + '**' }) |`n") }
     }
-    if ($lines.Count -eq 0) { [void]$history.Append("<tr><td colspan='7' class='none'>none yet</td></tr>") }
+    if ($lines.Count -eq 0) { [void]$history.Append("<tr><td colspan='8' class='none'>none yet</td></tr>") }
     $page = @"
 <!doctype html>
 <html><head><meta charset="utf-8"><meta http-equiv="refresh" content="5"><title>heavy slot</title>
@@ -271,13 +300,14 @@ th { background: var(--head); font-weight: 600; } td.cmd { font-family: Consolas
 .kind.exclusive { color: var(--ex); font-weight: 600; } .kind.heavy { color: var(--hv); } .ok { color: var(--ok); } .bad { color: var(--bad); font-weight: 600; }
 </style></head><body>
 <h1>$(Html $title)</h1>
-<div class="muted">One heavy job at a time (tools\heavy\heavy.cmd). Written $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); reloads every 5 s.</div>
+<div class="muted">One heavy job at a time. Written $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); reloads every 5 s.</div>
+$(if ($heldWhy) { "<p class='bad'>Held: $(Html $heldWhy). No job starts until it is released.</p>" })
 <h2>Running</h2>
 <table><tr><th>kind</th><th>thread</th><th>command</th><th>started</th><th>running</th><th>estimate</th><th>done</th><th>pid</th></tr>$($rows.ToString())</table>
 <h2>Waiting</h2>
 <table><tr><th>#</th><th>kind</th><th>thread</th><th>command</th><th>queued</th><th>waiting</th><th>estimate</th><th>runs</th></tr>$($queue.ToString())</table>
 <h2>Finished (last 200)</h2>
-<table><tr><th>kind</th><th>thread</th><th>command</th><th>started</th><th>waited</th><th>took</th><th>exit</th></tr>$($history.ToString())</table>
+<table><tr><th>kind</th><th>thread</th><th>command</th><th>started</th><th>waited</th><th>took</th><th>estimate</th><th>exit</th></tr>$($history.ToString())</table>
 <script>
 function d(s) { s = Math.max(0, Math.floor(s)); var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
   return h ? h + 'h ' + String(m).padStart(2, '0') + 'm' : m ? m + 'm ' + String(x).padStart(2, '0') + 's' : x + 's'; }
@@ -292,13 +322,16 @@ tick(); setInterval(tick, 1000);
     # The same as markdown (status.md), for reading in a terminal or an editor.
     $noneQueue = if ($mdQueue.Length) { '' } else { "| | nobody waiting | | | | | | |`n" }
     $text = "# $title`n`nWritten $($now.ToString('yyyy-MM-dd HH:mm:ss')) (this machine's times; durations as of then).`n`n" +
+      $(if ($heldWhy) { "**Held:** $(MdText $heldWhy). No job starts until it is released.`n`n" }) +
       "## Running`n`n| kind | thread | command | started | running | estimate | done |`n|---|---|---|---|---|---|---|`n" + $md.ToString() +
       "`n## Waiting`n`n| # | kind | thread | command | queued | waiting | estimate | runs |`n|---|---|---|---|---|---|---|---|`n" + $mdQueue.ToString() + $noneQueue +
-      "`n## Finished`n`n| kind | thread | command | started | waited | took | exit |`n|---|---|---|---|---|---|---|`n" + $mdHistory.ToString()
+      "`n## Finished`n`n| kind | thread | command | started | waited | took | estimate | exit |`n|---|---|---|---|---|---|---|---|`n" + $mdHistory.ToString()
     $mdFile = Join-Path $root 'status.md'
     # And as JSON (status.json), for whatever shows the status elsewhere: with ROOT\publish.txt (the board's
     # address and password), machine\publish.ps1 is started after every change and posts it to the board.
-    $json = ([ordered]@{ written = (Iso $now); running = $jRunning; queue = @($jQueue); finished = @($jFinished) } | ConvertTo-Json -Depth 4 -Compress)
+    $whole = [ordered]@{ written = (Iso $now); running = $jRunning; queue = @($jQueue); finished = @($jFinished) }
+    if ($heldWhy) { $whole.held = $heldWhy }
+    $json = ($whole | ConvertTo-Json -Depth 4 -Compress)
     $jsonFile = Join-Path $root 'status.json'
     [IO.File]::WriteAllText("$jsonFile.$PID.tmp", $json, (New-Object System.Text.UTF8Encoding($false)))
     Move-Item -Force "$jsonFile.$PID.tmp" $jsonFile
@@ -329,16 +362,16 @@ function Run-Command
   return $process.ExitCode
 }
 
-# Inside a heavy job already (its own child): no second wait. CI (GITHUB_ACTIONS) and a machine whose data
-# folder's parent does not exist have no lock.
-if ($env:HEAVY_QUEUE_HELD -or ($heldVariable -and [Environment]::GetEnvironmentVariable($heldVariable)) -or $env:GITHUB_ACTIONS -or -not (Test-Path (Split-Path $root))) { exit (Run-Command) }
+# Inside a heavy job already (its own child): no second wait. Under CI (CI or GITHUB_ACTIONS set) a runner
+# runs one job anyway: no lock either.
+if ($env:HEAVY_QUEUE_HELD -or ($heldVariable -and [Environment]::GetEnvironmentVariable($heldVariable)) -or $env:CI -or $env:GITHUB_ACTIONS) { exit (Run-Command) }
 
 New-Item -ItemType Directory -Force $queueDir | Out-Null
 # A machine too slow or too different for timing has ROOT\no-benchmarks: an --exclusive job is refused there
 # at once.
 if ($exclusive -and (Test-Path (Join-Path $root 'no-benchmarks')))
 {
-  [Console]::Error.WriteLine("heavy: $($env:COMPUTERNAME) does not run benchmarks or timing runs ($root\no-benchmarks): run --exclusive jobs on a benchmark machine.")
+  [Console]::Error.WriteLine("heavy: $machine does not run benchmarks or timing runs ($root\no-benchmarks): run --exclusive jobs on a benchmark machine.")
   exit 2
 }
 $label = if ($name) { $name } else { $line }
@@ -369,16 +402,16 @@ function First-In-Queue
   return $true
 }
 
+# Why this waiter may not start yet besides the slot, or $null. A quiet flag whose holder died is removed.
 function Machine-Held
 {
-  $first = Get-Content $schedule -TotalCount 1 -ErrorAction SilentlyContinue
-  if ($first -and $first.Trim() -ne 'HOLD: no') { return "$(Split-Path -Leaf $schedule) line 1 is '$($first.Trim())'" }
   if (Test-Path $flag)
   {
-    $text = Get-Content -Raw $flag -ErrorAction SilentlyContinue
+    $text = (Get-Content -Raw $flag -ErrorAction SilentlyContinue) + ''
     if ($text -match 'heavy pid (\d+)' -and -not (Alive ([int]$matches[1]))) { Remove-Item $flag -Force -ErrorAction SilentlyContinue }
-    else { return '$(Split-Path -Leaf $flag) exists' }
   }
+  $why = Hold-Reason
+  if ($why) { return $why }
   return $null
 }
 
@@ -413,13 +446,14 @@ try
   if ($exclusive)
   {
     Write-Shared $flag "heavy pid $PID ($label)"
-    # Otherwise idle: total CPU under 15% for 20 seconds in a row (a desktop with a few apps open sits near 7%).
+    # Otherwise idle: total CPU under idleLoad percent (15) for idleSeconds (20) in a row; a desktop with a few
+    # apps open sits near 7%.
     $quiet = 0
     $said = ''
-    while ($quiet -lt 20)
+    while ($quiet -lt $idleSeconds)
     {
       $load = (Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average
-      if ($load -lt 15) { $quiet += 2 } else
+      if ($load -lt $idleLoad) { $quiet += 2 } else
       {
         $quiet = 0
         $now = 'heavy: exclusive, waiting for the machine to go idle'

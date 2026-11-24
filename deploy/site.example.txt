@@ -1,3 +1,4 @@
 user@ssh.example.com
 /home/public/heavy
 /home/protected/heavyboard
+web

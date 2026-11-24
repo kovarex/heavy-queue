@@ -1,3 +1,2 @@
 https://example.com/heavy/index.cgi
 THE-POSTING-PASSWORD
-MACHINE-NAME (optional: else the computer name without PC-)

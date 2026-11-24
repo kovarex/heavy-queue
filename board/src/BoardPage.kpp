@@ -1,8 +1,9 @@
 // The page: static; its script reads ?json every 5 seconds and draws each machine (open or closed, with
-// an Open / Close button for the ones that take a button), then the jobs running now, the queues and the
-// finished jobs of all machines together, each row naming its machine. Running times are counted in the
-// browser (the times the machines post carry their UTC offset). The button asks for the password once
-// and keeps it in this browser.
+// Open / Close buttons for the machines whose gate asks the board), then the jobs running now, the queues
+// with their estimates and the finished jobs of all machines together, each row naming its machine, and
+// links to the other pages. Running times and ETAs are counted in the browser (the times the machines post
+// carry their UTC offset). The buttons ask for the control password once and keep it in this browser. It
+// also reads a board that knows no "gated" (it then goes by "seen").
 constexpr std::StringView boardPage = R"(<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>heavy slot</title>
@@ -21,7 +22,7 @@ th { background: var(--head); font-weight: 600; } td.cmd { font-family: Consolas
 button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; margin-top: 8px; }
 </style></head><body>
 <h1>Heavy jobs</h1>
-<div class="muted"><span id="written">loading...</span> <span id="control"></span></div>
+<div class="muted"><span id="written">loading...</span> <span id="control"></span> <span id="pages"></span></div>
 <form id="login" method="post" action="?login" target="loginFrame" style="display: none; margin-top: 8px;">
 <input type="text" name="username" value="heavy control" autocomplete="username" readonly style="display: none;">
 <input id="loginPassword" type="password" name="password" autocomplete="current-password" placeholder="control password">
@@ -34,7 +35,7 @@ button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid
 <h2>Waiting</h2>
 <div class="wrap"><table><thead><tr><th>machine</th><th>#</th><th>kind</th><th>thread</th><th>command</th><th>queued</th><th>waiting</th><th>estimate</th><th>runs</th></tr></thead><tbody id="queue"></tbody></table></div>
 <h2>Finished</h2>
-<div class="wrap"><table><thead><tr><th>machine</th><th>kind</th><th>thread</th><th>command</th><th>started</th><th>waited</th><th>took</th><th>exit</th></tr></thead><tbody id="finished"></tbody></table></div>
+<div class="wrap"><table><thead><tr><th>machine</th><th>kind</th><th>thread</th><th>command</th><th>started</th><th>waited</th><th>took</th><th>estimate</th><th>exit</th></tr></thead><tbody id="finished"></tbody></table></div>
 <script>
 function d(s) { s = Math.max(0, Math.floor(s)); var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
   return h ? h + 'h ' + String(m).padStart(2, '0') + 'm' : m ? m + 'm ' + String(x).padStart(2, '0') + 's' : x + 's'; }
@@ -42,7 +43,8 @@ function t(iso, withDay) { var v = new Date(iso); if (isNaN(v)) return ''; var t
   return (withDay ? two(v.getMonth() + 1) + '-' + two(v.getDate()) + ' ' : '') + two(v.getHours()) + ':' + two(v.getMinutes()) + ':' + two(v.getSeconds()); }
 // Estimates (the lock's: what the job gave, else similar finished jobs; its basis in brackets). A machine's
 // line is counted from now: the running job ends at its start plus its estimate (or now, once over it),
-// each waiting job starts when the one before it ends. Unknown after a job without one, or while closed.
+// each waiting job starts when the one before it ends. Unknown after a job without one, or while the
+// machine is closed or held.
 function est(j) { return j.estimate == null ? '' : d(j.estimate) + ' (' + (j.basis || '?') + ')'; }
 function hm(ms) { var v = new Date(ms), two = function (n) { return String(n).padStart(2, '0'); };
   return '~' + (new Date().toDateString() === v.toDateString() ? '' : two(v.getMonth() + 1) + '-' + two(v.getDate()) + ' ') + two(v.getHours()) + ':' + two(v.getMinutes()); }
@@ -76,13 +78,15 @@ function draw(all) {
     line.textContent = s.running ? 'running: ' + (s.running.thread || s.running.folder) : (s.written ? 'idle' : 'no job yet');
     if (m.seen) { var ago = (Date.now() - new Date(m.seen)) / 1000; if (!isNaN(ago)) line.textContent += ago > 90 ? ' (offline? last seen ' + d(ago) + ' ago)' : ''; }
     card.appendChild(line);
-    if (!m.fixed && password()) {
+    if (s.held && m.open) { var held = document.createElement('div'); held.className = 'bad'; held.textContent = 'held: ' + s.held; card.appendChild(held); }
+    var gated = m.gated || !!m.seen;
+    if (gated && password()) {
       var add = function (text, value, title) { var b = document.createElement('button'); b.textContent = text; b.title = title; b.style.marginRight = '6px';
         b.onclick = function () { setOpen(m.name, value); }; card.appendChild(b); };
       if (m.open) { add('Close', '0', 'Start nothing new; the running job finishes'); add('Close now', 'hard', 'Start nothing new and stop the running job'); }
       else { add('Open', '1', 'Take heavy jobs'); if (st === 'closed' && s.running) add('Stop job now', 'hard', 'Stop the running job too'); } }
     cards.appendChild(card);
-    var next = m.open ? Date.now() : null;
+    var next = m.open && !s.held ? Date.now() : null;
     if (s.running) { var r = running.insertRow(); cell(r, m.name); cell(r, s.running.kind, s.running.kind); cell(r, s.running.thread || s.running.folder); cell(r, s.running.label, 'cmd'); cell(r, t(s.running.since));
       cell(r, '').dataset.since = s.running.since; cell(r, est(s.running));
       if (s.running.estimate == null) { cell(r, ''); next = null; }
@@ -90,7 +94,7 @@ function draw(all) {
         cell(r, end < Date.now() ? 'over by ' + d((Date.now() - end) / 1000) : hm(end)); if (next != null) next = Math.max(next, end); } }
     (s.queue || []).forEach(function (q, i) { var r = queue.insertRow(); cell(r, m.name); cell(r, i + 1); cell(r, q.kind, q.kind); cell(r, q.thread || q.folder); cell(r, q.label, 'cmd'); cell(r, t(q.since));
       cell(r, '').dataset.since = q.since; cell(r, est(q));
-      if (next == null) cell(r, m.open ? '' : 'machine closed', 'muted');
+      if (next == null) cell(r, !m.open ? 'machine closed' : s.held ? 'held' : '', 'muted');
       else { var from = next; next = q.estimate == null ? null : next + q.estimate * 1000; cell(r, hm(from) + (next == null ? '' : ' - ' + hm(next))); } });
     (s.finished || []).forEach(function (f) { f.machine = m.name; ended.push(f); });
   });
@@ -98,8 +102,10 @@ function draw(all) {
   if (!queue.rows.length) none(queue, 9, 'nobody waiting');
   ended.sort(function (a, b) { return new Date(b.ended) - new Date(a.ended); });
   ended.slice(0, 200).forEach(function (f) { var r = finished.insertRow(); cell(r, f.machine); cell(r, f.kind, f.kind); cell(r, f.thread || f.folder); cell(r, f.label, 'cmd'); cell(r, t(f.started, true));
-    cell(r, d((new Date(f.started) - new Date(f.queued)) / 1000)); cell(r, d((new Date(f.ended) - new Date(f.started)) / 1000)); cell(r, f.exit, f.exit === 0 ? 'ok' : 'bad'); });
-  if (!ended.length) none(finished, 8, 'none yet');
+    cell(r, d((new Date(f.started) - new Date(f.queued)) / 1000)); cell(r, d((new Date(f.ended) - new Date(f.started)) / 1000)); cell(r, est(f)); cell(r, f.exit, f.exit === 0 ? 'ok' : 'bad'); });
+  if (!ended.length) none(finished, 9, 'none yet');
+  var links = document.getElementById('pages'); links.innerHTML = '';
+  (all.pages || []).forEach(function (p) { var a = document.createElement('a'); a.href = '?page=' + encodeURIComponent(p); a.textContent = p; a.style.marginRight = '8px'; links.appendChild(a); });
   document.getElementById('control').innerHTML = password() ? '<a href="#" onclick="lock(); return false;">lock control</a>' : '<a href="#" onclick="unlock(); return false;">control</a>';
   document.getElementById('written').textContent = latest ? 'Last posted ' + t(latest, true) + ' (your local time). Reloads every 5 s.' : 'Nothing posted yet.';
   tick(); }

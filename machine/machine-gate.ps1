@@ -1,15 +1,13 @@
 # Lets the board's buttons open and close this machine. Every 15 seconds it asks the board (ROOT\publish.txt's
-# address) whether this machine is open and writes the answer into line 1 of the hold file, which the lock
-# reads before starting a job: "HOLD: no" when open, "HOLD: yes (closed on the board)" when closed or when
-# the board cannot be reached. A closed machine starts no new heavy job; the one running finishes (Close) or
-# is stopped at once (Close now: "stopped"): its command's processes are killed and the lock prints
-# "heavy: STOPPED: ..." with a nonzero exit code, so whoever started it can run it again here or elsewhere.
-# A board that cannot be reached holds new jobs but stops none. The rest of the hold file is kept. Started
-# at logon (setup-machine.ps1 registers it); one at a time.
+# address) whether this machine (the config's machine name) is open, and writes the answer into line 1 of
+# the hold file, which the lock reads before starting a job: "HOLD: no" when open, "HOLD: yes (closed on
+# the board)" when closed or when the board cannot be reached. A closed machine starts no new heavy job; the
+# one running finishes (Close) or is stopped at once (Close now: "stopped"): its command's processes are
+# killed and the lock prints "heavy: STOPPED: ..." with a nonzero exit code, so whoever started it can run
+# it again here or elsewhere. A board that cannot be reached holds new jobs but stops none. The rest of the
+# hold file is kept. Started at logon (setup-machine.ps1 registers it); one at a time.
 . (Join-Path (Split-Path $PSScriptRoot) 'lock\config.ps1')
-$named = @(Get-Content (Join-Path $root 'publish.txt') -TotalCount 3 -ErrorAction SilentlyContinue)
-$machine = if ($env:MACHINE_GATE_NAME) { $env:MACHINE_GATE_NAME } elseif ($named.Count -ge 3 -and $named[2].Trim()) { $named[2].Trim() } else { $env:COMPUTERNAME -replace '^PC-', '' } # (publish.txt's third line, as publish.ps1 reads it; the variable: for testing)
-$mutex = New-Object System.Threading.Mutex($false, "$mutexName-machine-gate$($env:MACHINE_GATE_NAME)")
+$mutex = New-Object System.Threading.Mutex($false, "$mutexName-machine-gate")
 $held = $false
 try { $held = $mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $held = $true }
 if (-not $held) { exit 0 }
@@ -19,8 +17,8 @@ while ($true)
   $state = 'unreachable'
   try
   {
-    $address = if ($env:MACHINE_GATE_ADDRESS) { $env:MACHINE_GATE_ADDRESS } else { (Get-Content (Join-Path $root 'publish.txt') -TotalCount 1).Trim() }
-    $answer = Invoke-WebRequest -UseBasicParsing -Uri "$address`?state&machine=$machine$(if (Test-Path (Join-Path $root 'no-benchmarks')) { '&role=builds' })&now=$([Uri]::EscapeDataString((Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')))" -TimeoutSec 20
+    $address = (Get-Content (Join-Path $root 'publish.txt') -TotalCount 1).Trim()
+    $answer = Invoke-WebRequest -UseBasicParsing -Uri "$address`?state&machine=$([Uri]::EscapeDataString($machine))$(if (Test-Path (Join-Path $root 'no-benchmarks')) { '&role=builds' })&now=$([Uri]::EscapeDataString((Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')))" -TimeoutSec 20
     $state = $answer.Content.Trim()
   }
   catch { }

@@ -1,5 +1,6 @@
-// heavyboard's handler on a data directory of its own: the page, an update with no, a wrong and the
-// right password, what ?json gives back, and an update that is not JSON.
+// heavyboard's handler on a data directory of its own: the page, updates with no, a wrong and the right
+// password, what ?json gives back, gated and ungated machines and their buttons, other pages and
+// documents, and requests it does not know.
 std::String boardTestDirectoryName() { return std::filesystem::temp_directory_path().string() + "/heavyboard-test"; }
 
 std::String boardTestDirectory()
@@ -10,13 +11,19 @@ std::String boardTestDirectory()
   return directory;
 }
 
+// query: "NAME" or "NAME=VALUE"; ?open's value is the body.
 http::HttpResponse boardTestCall(std::StringView method, std::StringView query, std::StringView password, std::StringView body, std::StringView machine = std::StringView())
 {
   http::HttpRequest request;
   request.method = std::String(method);
   request.path = "/index.cgi";
   if (!query.empty())
-    request.parameters.push_back(url::UrlQueryParameter{std::String(query), std::String(query == "open" ? std::StringView(body) : std::StringView())});
+  {
+    usize equals = query.find('=');
+    std::StringView name = equals == std::StringView::npos ? query : query.substr(0, equals);
+    std::StringView value = equals == std::StringView::npos ? std::StringView() : query.substr(equals + 1);
+    request.parameters.push_back(url::UrlQueryParameter{std::String(name), std::String(name == "open" ? body : value)});
+  }
   if (!machine.empty())
     request.parameters.push_back(url::UrlQueryParameter{"machine", std::String(machine)});
   if (!password.empty())
@@ -31,9 +38,7 @@ test BoardUpdates
 {
   std::String directory = boardTestDirectory();
   check(boardTestCall("GET", "", "", "").body.find("<h1>Heavy jobs</h1>") != std::String::npos);
-  check(boardTestCall("GET", "json", "", "").body == "{\"machines\":[]}");
-  boardWriteFile(directory + "/always-open", "main\r\n\n");
-  check(boardTestCall("GET", "json", "", "").body == "{\"machines\":[{\"name\":\"MAIN\",\"open\":true,\"state\":\"open\",\"fixed\":true}]}");
+  check(boardTestCall("GET", "json", "", "").body == "{\"machines\":[],\"pages\":[]}");
   check(boardTestCall("POST", "update", "secret", "{}", "MAIN").status == 503); // no password set yet
   boardWriteFile(directory + "/password", "secret  \n");
   boardWriteFile(directory + "/control-password", "boss\n");
@@ -44,30 +49,50 @@ test BoardUpdates
   check(boardTestCall("POST", "update", "secret", "{\"written\": 1,}", "MAIN").status == 400);
   check(boardTestCall("POST", "update", "secret", "[1]", "MAIN").status == 400);
   check(boardTestCall("POST", "update", "secret", "{}").status == 400); // no machine named
+  // MAIN has no gate: it shows as open, without buttons
   check(boardTestCall("POST", "update", "secret", "{\"running\": null, \"queue\": []}", "main").status == 204);
-  check(boardTestCall("GET", "json", "", "").body == "{\"machines\":[{\"name\":\"MAIN\",\"open\":true,\"state\":\"open\",\"fixed\":true,\"status\":{\"running\":null,\"queue\":[]}}]}");
-  // OTHER, not in always-open: closed until opened, its own status, the button's password
+  check(boardTestCall("GET", "json", "", "").body == "{\"machines\":[{\"name\":\"MAIN\",\"open\":true,\"state\":\"open\",\"status\":{\"running\":null,\"queue\":[]}}],\"pages\":[]}");
+  // OTHER's gate asks: it is gated, closed until opened, with its own status and the buttons' password
   check(boardTestCall("GET", "state", "", "", "other").body == "closed\n");
   check(boardTestCall("POST", "open", "nope", "1", "OTHER").status == 403);
   check(boardTestCall("POST", "open", "boss", "1", "OTHER").status == 204);
   check(boardTestCall("GET", "state", "", "", "OTHER").body == "open\n");
   check(boardTestCall("POST", "update", "secret", "{\"queue\":[]}", "OTHER").status == 204);
-  check(boardTestCall("GET", "json", "", "").body.find("{\"name\":\"OTHER\",\"open\":true,\"state\":\"open\",\"status\":{\"queue\":[]}}") != std::String::npos);
+  check(boardTestCall("GET", "json", "", "").body.find("{\"name\":\"OTHER\",\"open\":true,\"state\":\"open\",\"gated\":true,\"status\":{\"queue\":[]}}") != std::String::npos);
   check(boardTestCall("POST", "open", "boss", "0", "OTHER").status == 204);
   check(boardTestCall("GET", "state", "", "", "OTHER").body == "closed\n");
   check(boardTestCall("GET", "state", "", "", "bad name").status == 400);
   check(boardTestCall("POST", "open", "boss", "hard", "OTHER").status == 204);
   check(boardTestCall("GET", "state", "", "", "OTHER").body == "stopped\n");
   check(boardTestCall("POST", "open", "boss", "maybe", "OTHER").status == 400);
+  // the main page, replaced
   check(boardTestCall("POST", "page", "nope", "<p>x</p>").status == 403);
   check(boardTestCall("POST", "page", "secret", "<p>new page</p>").status == 204);
   check(boardTestCall("GET", "", "", "").body == "<p>new page</p>");
+  // another page and its document
+  check(boardTestCall("GET", "page=bench", "", "").status == 404);
+  check(boardTestCall("POST", "page=bench", "boss", "<p>b</p>").status == 403);
+  check(boardTestCall("POST", "page=Bench", "secret", "<p>b</p>").status == 400);
+  check(boardTestCall("POST", "page=bench", "secret", "<p>bench</p>").status == 204);
+  check(boardTestCall("GET", "page=bench", "", "").body == "<p>bench</p>");
+  check(boardTestCall("GET", "json", "", "").body.find("\"pages\":[\"bench\"]") != std::String::npos);
+  check(boardTestCall("GET", "doc=bench", "", "").status == 404);
+  check(boardTestCall("POST", "doc=bench", "", "{}").status == 403);
+  check(boardTestCall("POST", "doc=bench", "secret", "1").status == 400);
+  check(boardTestCall("POST", "doc=bench", "secret", "{\"runs\": [1, 2]}").status == 204);
+  check(boardTestCall("GET", "doc=bench", "", "").body == "{\"runs\":[1,2]}");
+  check(boardTestCall("POST", "doc=bench", "secret", "[3]").status == 204);
+  check(boardTestCall("GET", "doc=bench", "", "").body == "[3]");
+  check(boardTestCall("GET", "doc=../password", "", "").status == 400);
+  // a POST the board does not know is refused, not answered with the page
+  check(boardTestCall("POST", "bench", "secret", "{}").status == 400);
+  check(boardTestCall("POST", "", "secret", "{}").status == 400);
   // guessing: 5 wrong control passwords (two above, three here) lock control out, the right one too
   for (i32 i = 0; i < 3; ++i)
     check(boardTestCall("POST", "open", "guess", "1", "OTHER").status == 403);
   check(boardTestCall("POST", "open", "boss", "1", "OTHER").status == 429);
   check(boardTestCall("POST", "update", "secret", "{}", "OTHER").status == 204); // posting is not locked
-  // a builds-only machine says so when it asks for its state
+  // a builds-only machine says so when it asks for its state; machines come in name order
   {
     http::HttpRequest request;
     request.method = "GET";
@@ -78,5 +103,7 @@ test BoardUpdates
     http::HttpResponse response;
     boardHandleIn(request, response, boardTestDirectoryName());
   }
-  check(boardTestCall("GET", "json", "", "").body.find("\"name\":\"HELPER\",\"open\":false,\"state\":\"closed\",\"seen\":\"2026-11-23T23:00:00+01:00\",\"role\":\"builds\"") != std::String::npos);
+  std::String all = boardTestCall("GET", "json", "", "").body;
+  check(all.find("{\"machines\":[{\"name\":\"HELPER\",\"open\":false,\"state\":\"closed\",\"gated\":true,\"seen\":\"2026-11-23T23:00:00+01:00\",\"role\":\"builds\"}") == 0);
+  check(all.find("\"name\":\"MAIN\"") < all.find("\"name\":\"OTHER\""));
 }
