@@ -91,7 +91,16 @@ function Fingerprint
 {
   $parts = foreach ($c in @($fingerprintCommands))
   {
-    $output = (& $env:ComSpec /d /c "$c" 2>&1 | Out-String).Trim()
+    # (cmd /s /c "LINE": the outer quotes go, a quoted program path in LINE stays as it is)
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $env:ComSpec
+    $info.Arguments = '/d /s /c "' + $c + ' 2>&1"'
+    $info.UseShellExecute = $false
+    $info.RedirectStandardOutput = $true
+    $info.CreateNoWindow = $true
+    $p = [System.Diagnostics.Process]::Start($info)
+    $output = $p.StandardOutput.ReadToEnd().Trim()
+    $p.WaitForExit()
     "$c => $output"
   }
   return (@($parts) -join "`n")
