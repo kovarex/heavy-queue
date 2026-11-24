@@ -22,8 +22,34 @@
 - **No benchmarks here:** with `ROOT\no-benchmarks`, an `--exclusive` job is refused at once (exit 2).
 - **CI:** with `CI` or `GITHUB_ACTIONS` set, the command runs straight away.
 - **Exit code:** the command's.
-- **Only this machine:** a job runs where it was started, with that machine's files. The lock never
-  moves a job to another machine; another machine takes work when something is started there.
+
+## Jobs that travel
+
+A waiting job may run on another machine, a worker, in the same folder: the worker sees this machine's
+folders at the same paths (machine\share-home.ps1 shares them here, machine\setup-worker.ps1 maps them
+there), so the job sees the same files, git included, and nothing is copied. For whoever started it, the
+job ran as before: its output comes back to heavy.cmd as it is written, then its exit code, with a line
+saying where it ran.
+
+- **Which jobs:** a job travels when its folder and every path in its command line are in `travelRoots`
+  (or `samePaths`, the same on every machine). `--local` keeps a job here. An `--exclusive` job (a timing
+  run) travels only with `--travel`, as its numbers would come from another machine. The pages say why a
+  waiting job stays ("stays here: ...") or that it may travel.
+- **Which worker:** an open worker whose slot is free and that has nothing queued claims the oldest job it
+  may run: same tools (the `fingerprint` commands' output, checked again right before it claims), no
+  `--exclusive` job on a no-benchmarks machine, and no job running anywhere in the same folder (or one
+  inside the other) or for the same thread. A thread's jobs ran one after another here; they still do,
+  wherever they run. Whoever claims first runs the job, this machine included (a claim is a file made with
+  CreateNew).
+- **What it takes along:** the command line, the folder, the label, the thread, the estimate and the
+  environment, without what names this machine (COMPUTERNAME, TEMP, ...) and without secrets (any variable
+  whose name has TOKEN, SECRET, PASSWORD, KEY, AUTH, CREDENTIAL, ...): a worker keeps its own.
+- **When something dies:** a worker that stops answering for `travelStale` seconds (90) ends the job here
+  with `heavy: STOPPED: ... Run it again.` and exit 1; its lock and everything the job started are in a job
+  object that ends with the lock, so nothing keeps running in the shared folder. A waiter here that goes
+  away makes the worker stop the job.
+- **Files:** `ROOT\travel\ID.*` (lock\travel.ps1 lists them). The worker writes its note (what it does, or
+  why it takes nothing, such as other tools) to its `ROOT\worker.txt`, which its pages and the board show.
 
 ## Who started a job
 
@@ -65,3 +91,9 @@ default:
 | title | the status page's heading | `MACHINE heavy slot` |
 | idleLoad | `--exclusive`: idle below this total CPU percent | 15 |
 | idleSeconds | `--exclusive`: for this many seconds in a row | 20 |
+| computer | the computer this config belongs to: the lock refuses to run on another with it | none |
+| travelRoots | this machine's folders that workers see at the same paths: jobs in them may travel | none (nothing travels) |
+| samePaths | paths that are the same on every machine, which a travelling job may name | Program Files, Windows |
+| fingerprint | commands whose output must be the same on two machines for one to run the other's jobs | none |
+| home | on a worker: its home's data folder, as the worker sees it | none (not a worker) |
+| travelStale | seconds without a heartbeat before the other side of a travelled job counts as gone | 90 |

@@ -2,8 +2,11 @@
 # (builds, test runs, benchmarks) run one at a time. --exclusive (benchmarks and every timing run) takes the
 # same slot and then also waits until the machine is otherwise idle.
 #
-#   heavy.cmd [--exclusive] [--name TEXT] [--estimate 90s|10m|2h] COMMAND LINE...
+#   heavy.cmd [--exclusive] [--name TEXT] [--estimate 90s|10m|2h] [--local | --travel] COMMAND LINE...
 #   heavy.cmd --status
+#
+# A waiting job may run on another machine instead, in the same folder (lock\travel.ps1): --local keeps it
+# here, --travel lets an --exclusive one go too.
 #
 # The slot is a named mutex: Windows frees it when its holder dies, so a killed job never leaves the
 # machine locked. Waiters queue in arrival order (ROOT\queue, one file per waiting process; a dead waiter's
@@ -25,6 +28,9 @@ $exclusive = $false
 $name = ''
 $status = $false
 $given = ''
+$stayHere = $false
+$mayTravel = $false
+$travelledFile = ''
 while ($true)
 {
   if ($line -match '^--exclusive(\s+|$)(.*)$') { $exclusive = $true; $line = $matches[2]; continue }
@@ -32,8 +38,14 @@ while ($true)
   if ($line -match '^--status(\s+|$)(.*)$') { $status = $true; $line = $matches[2]; continue }
   if ($line -match '^--name\s+"([^"]*)"\s*(.*)$') { $name = $matches[1]; $line = $matches[2]; continue }
   if ($line -match '^--name\s+(\S+)\s*(.*)$') { $name = $matches[1]; $line = $matches[2]; continue }
+  if ($line -match '^--local(\s+|$)(.*)$') { $stayHere = $true; $line = $matches[2]; continue }
+  if ($line -match '^--travel(\s+|$)(.*)$') { $mayTravel = $true; $line = $matches[2]; continue }
+  # (machine\worker.ps1: run another machine's job, claimed for this one)
+  if ($line -match '^--run-travelled\s+"([^"]+)"\s*$') { $travelledFile = $matches[1]; $line = ''; continue }
   break
 }
+. (Join-Path $PSScriptRoot 'travel.ps1')
+$script:travelHere = $travelDir
 
 # Writes a file other jobs read all the time (holder.txt, the queue's, the flag): a reader holding it
 # open for a moment made Set-Content fail and the job end ("being used by another process", 2026-11-23),
@@ -240,6 +252,22 @@ function Write-Page
     }
     else { [void]$rows.Append("<tr><td colspan='8' class='none'>free</td></tr>"); [void]$md.Append("| free | | | | | | |`n") }
     if ($heldWhy) { $next = $null }
+    # On a worker (machine\worker.ps1 writes ROOT\worker.txt): what it does for its home, or why it does not.
+    $workerNote = Read-Small (Join-Path $root 'worker.txt')
+    # This machine's jobs that travelled and run elsewhere now (their worker's status shows them too).
+    $jElsewhere = New-Object System.Collections.ArrayList
+    foreach ($claim in @(Get-ChildItem $travelDir -Filter '*.claim' -File -ErrorAction SilentlyContinue | Sort-Object Name))
+    {
+      $id = $claim.Name -replace '\.claim$', ''
+      $who = Read-Small $claim.FullName
+      if (-not $who -or $who -eq $machine -or (Test-Path (Travel-File $id 'exit'))) { continue }
+      $text = Read-Small (Travel-File $id 'job.json')
+      if (-not $text) { continue }
+      $o = $text | ConvertFrom-Json
+      [void]$jElsewhere.Add([ordered]@{ machine = $who; kind = $o.kind; thread = (Owner $o.thread $o.cwd); folder = (Who $o.cwd); label = $o.label; since = $o.queued })
+      [void]$rows.Append("<tr><td class='kind travelled'>on $(Html $who)</td><td>$(Html (Owner $o.thread $o.cwd))</td><td class='cmd'>$(Html $o.label)</td><td></td><td></td><td></td><td></td><td>$(Html $who)</td></tr>")
+      [void]$md.Append("| on $who | $(Owner $o.thread $o.cwd) | ``$(MdText $o.label)`` | | | | |`n")
+    }
     $mdQueue = New-Object System.Text.StringBuilder
     $queue = New-Object System.Text.StringBuilder
     $n = 0
@@ -249,6 +277,10 @@ function Write-Page
       if (-not $r -or -not (Alive $r.Pid)) { continue }
       $n++
       $job = [ordered]@{ kind = $r.Kind; thread = (Owner $r.Thread $r.Cwd); folder = (Who $r.Cwd); label = $r.Label; since = (Iso $r.Since) }
+      $stays = Read-Small (Join-Path $travelDir "$($w.BaseName).stays")
+      $travelNote = ''
+      if (Test-Path (Join-Path $travelDir "$($w.BaseName).job.json")) { $job.travel = $true; $travelNote = ' (may travel)' }
+      elseif ($stays) { $job.stays = $stays; $travelNote = " (stays here: $stays)" }
       $e = Estimate $r
       $estText = ''; $startText = ''
       if ($e) { $job.estimate = $e.seconds; $job.basis = $e.basis; $estText = (Duration ([TimeSpan]::FromSeconds($e.seconds))) + " ($($e.basis))" }
@@ -259,8 +291,8 @@ function Write-Page
       }
       elseif ($heldWhy) { $startText = 'held' }
       [void]$jQueue.Add($job)
-      [void]$queue.Append("<tr><td>$n</td><td class='kind $($r.Kind)'>$($r.Kind)</td><td>$(Html (Owner $r.Thread $r.Cwd))</td><td class='cmd'>$(Html $r.Label)</td><td>$($r.Since.ToString('HH:mm:ss'))</td><td class='run' data-since='$($r.Since.ToString('s'))'></td><td>$estText</td><td>$startText</td></tr>")
-      [void]$mdQueue.Append("| $n | $($r.Kind) | $(Owner $r.Thread $r.Cwd) | ``$(MdText $r.Label)`` | $($r.Since.ToString('HH:mm')) | $(Duration ($now - $r.Since)) | $estText | $startText |`n")
+      [void]$queue.Append("<tr><td>$n</td><td class='kind $($r.Kind)'>$($r.Kind)</td><td>$(Html (Owner $r.Thread $r.Cwd))</td><td class='cmd'>$(Html $r.Label)<span class='muted'>$(Html $travelNote)</span></td><td>$($r.Since.ToString('HH:mm:ss'))</td><td class='run' data-since='$($r.Since.ToString('s'))'></td><td>$estText</td><td>$startText</td></tr>")
+      [void]$mdQueue.Append("| $n | $($r.Kind) | $(Owner $r.Thread $r.Cwd) | ``$(MdText $r.Label)``$travelNote | $($r.Since.ToString('HH:mm')) | $(Duration ($now - $r.Since)) | $estText | $startText |`n")
     }
     if ($n -eq 0) { [void]$queue.Append("<tr><td colspan='8' class='none'>nobody waiting</td></tr>") }
     $mdHistory = New-Object System.Text.StringBuilder
@@ -269,7 +301,8 @@ function Write-Page
     [array]::Reverse($lines)
     foreach ($l in $lines)
     {
-      # queued, started, finished (ISO), exit code, kind, cwd, label, thread, estimate at its start ("SECONDS BASIS")
+      # queued, started, finished (ISO), exit code, kind, cwd, label, thread, estimate at its start ("SECONDS BASIS"),
+      # the machine it travelled to
       $f = $l.TrimStart([char]0xFEFF) -split "`t"
       if ($f.Count -lt 7) { continue }
       $owner = if ($f.Count -ge 8) { Owner $f[7] $f[5] } else { Who $f[5] }; $queued = [DateTime]$f[0]; $started = [DateTime]$f[1]; $ended = [DateTime]$f[2]
@@ -280,10 +313,12 @@ function Write-Page
       {
         $job = [ordered]@{ kind = $f[4]; thread = $owner; folder = (Who $f[5]); label = $f[6]; queued = (Iso $queued); started = (Iso $started); ended = (Iso $ended); exit = [int]$f[3] }
         if ($null -ne $guess) { $job.estimate = $guess; $job.basis = $guessBasis }
+        if ($f.Count -ge 10 -and $f[9]) { $job.ranOn = $f[9] }
         [void]$jFinished.Add($job)
       }
-      [void]$history.Append("<tr><td class='kind $($f[4])'>$($f[4])</td><td>$(Html $owner)</td><td class='cmd'>$(Html $f[6])</td><td>$($started.ToString('MM-dd HH:mm'))</td><td>$(Duration ($started - $queued))</td><td>$(Duration ($ended - $started))</td><td>$guessText</td><td class='$ok'>$($f[3])</td></tr>")
-      if ($mdHistory.Length -lt 20000) { [void]$mdHistory.Append("| $($f[4]) | $owner | ``$(MdText $f[6])`` | $($started.ToString('MM-dd HH:mm')) | $(Duration ($started - $queued)) | $(Duration ($ended - $started)) | $guessText | $(if ($f[3] -eq '0') { '0' } else { '**' + $f[3] + '**' }) |`n") }
+      $ranOn = if ($f.Count -ge 10 -and $f[9]) { " (ran on $($f[9]))" } else { '' }
+      [void]$history.Append("<tr><td class='kind $($f[4])'>$($f[4])</td><td>$(Html $owner)</td><td class='cmd'>$(Html $f[6])<span class='muted'>$(Html $ranOn)</span></td><td>$($started.ToString('MM-dd HH:mm'))</td><td>$(Duration ($started - $queued))</td><td>$(Duration ($ended - $started))</td><td>$guessText</td><td class='$ok'>$($f[3])</td></tr>")
+      if ($mdHistory.Length -lt 20000) { [void]$mdHistory.Append("| $($f[4]) | $owner | ``$(MdText $f[6])``$ranOn | $($started.ToString('MM-dd HH:mm')) | $(Duration ($started - $queued)) | $(Duration ($ended - $started)) | $guessText | $(if ($f[3] -eq '0') { '0' } else { '**' + $f[3] + '**' }) |`n") }
     }
     if ($lines.Count -eq 0) { [void]$history.Append("<tr><td colspan='8' class='none'>none yet</td></tr>") }
     $page = @"
@@ -300,7 +335,7 @@ th { background: var(--head); font-weight: 600; } td.cmd { font-family: Consolas
 .kind.exclusive { color: var(--ex); font-weight: 600; } .kind.heavy { color: var(--hv); } .ok { color: var(--ok); } .bad { color: var(--bad); font-weight: 600; }
 </style></head><body>
 <h1>$(Html $title)</h1>
-<div class="muted">One heavy job at a time. Written $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); reloads every 5 s.</div>
+<div class="muted">One heavy job at a time. Written $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); reloads every 5 s.$(if ($workerNote) { ' ' + (Html $workerNote) })</div>
 $(if ($heldWhy) { "<p class='bad'>Held: $(Html $heldWhy). No job starts until it is released.</p>" })
 <h2>Running</h2>
 <table><tr><th>kind</th><th>thread</th><th>command</th><th>started</th><th>running</th><th>estimate</th><th>done</th><th>pid</th></tr>$($rows.ToString())</table>
@@ -331,6 +366,8 @@ tick(); setInterval(tick, 1000);
     # address and password), machine\publish.ps1 is started after every change and posts it to the board.
     $whole = [ordered]@{ written = (Iso $now); running = $jRunning; queue = @($jQueue); finished = @($jFinished) }
     if ($heldWhy) { $whole.held = $heldWhy }
+    if ($jElsewhere.Count) { $whole.elsewhere = @($jElsewhere) }
+    if ($workerNote) { $whole.worker = $workerNote }
     $json = ($whole | ConvertTo-Json -Depth 4 -Compress)
     $jsonFile = Join-Path $root 'status.json'
     [IO.File]::WriteAllText("$jsonFile.$PID.tmp", $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -346,7 +383,29 @@ tick(); setInterval(tick, 1000);
 }
 
 if ($status) { Show-Status; Write-Page; exit 0 }
-if (-not $line) { 'usage: heavy.cmd [--exclusive] [--name TEXT] [--estimate 90s|10m|2h] COMMAND LINE...  |  heavy.cmd --status'; exit 2 }
+if (-not $line -and -not $travelledFile) { 'usage: heavy.cmd [--exclusive] [--name TEXT] [--estimate 90s|10m|2h] [--local | --travel] COMMAND LINE...  |  heavy.cmd --status'; exit 2 }
+
+# A job that travelled here (machine\worker.ps1 claimed it): its home's offer gives the command line, the
+# folder, the environment and what to show; its output and exit code go back through the home's travel
+# folder, and a home that stops watching (its waiter gone) stops the job.
+$travelled = $null
+if ($travelledFile)
+{
+  $travelled = Get-Content -Raw $travelledFile | ConvertFrom-Json
+  $script:travelHere = Split-Path $travelledFile
+  $line = $travelled.line
+  $exclusive = $travelled.kind -eq 'exclusive'
+  $name = "$($travelled.label) (from $($travelled.machine))"
+  if ($null -ne $travelled.estimate) { $given = "$($travelled.estimate)s" }
+  $env:HEAVY_QUEUE_THREAD = $travelled.thread
+  if (-not (Test-Path -LiteralPath $travelled.cwd))
+  {
+    Write-Shared (Travel-File $travelled.id 'err') "heavy: $($travelled.cwd) does not exist on $machine."
+    Write-Shared (Travel-File $travelled.id 'exit') "1 no folder"
+    exit 1
+  }
+  Set-Location -LiteralPath $travelled.cwd
+}
 
 function Run-Command
 {
@@ -355,17 +414,56 @@ function Run-Command
   $info.Arguments = '/d /s /c "' + $line + '"'
   $info.UseShellExecute = $false
   $info.WorkingDirectory = (Get-Location).Path
+  if ($travelled)
+  {
+    foreach ($p in $travelled.env.PSObject.Properties) { $info.EnvironmentVariables[$p.Name] = [string]$p.Value }
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.RedirectStandardInput = $true
+  }
   $info.EnvironmentVariables['HEAVY_QUEUE_HELD'] = "$PID"
   if ($heldVariable) { $info.EnvironmentVariables[$heldVariable] = "$PID" }
   $process = [System.Diagnostics.Process]::Start($info)
-  $process.WaitForExit()
+  if ($travelled) { $process.StandardInput.Close() } # (nobody types into a job that travelled)
+  if (-not $travelled)
+  {
+    $process.WaitForExit()
+    return $process.ExitCode
+  }
+  # Its output into the home's travel folder as it comes (unbuffered, so the home's waiter shows it at once),
+  # a heartbeat every 5 s, and the home's waiter watched: gone for 90 s, the job is stopped.
+  $outFile = New-Object IO.FileStream((Travel-File $travelled.id 'out'), [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1)
+  $errFile = New-Object IO.FileStream((Travel-File $travelled.id 'err'), [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite, 1)
+  $copyOut = $process.StandardOutput.BaseStream.CopyToAsync($outFile)
+  $copyErr = $process.StandardError.BaseStream.CopyToAsync($errFile)
+  $watch = Travel-File $travelled.id 'watch'
+  while (-not $process.WaitForExit(5000))
+  {
+    Beat (Travel-File $travelled.id 'alive') 'running'
+    if (-not (Fresh $watch))
+    {
+      $script:abandoned = $true
+      & taskkill /T /F /PID $process.Id 2>&1 | Out-Null
+    }
+  }
+  # (a process the job left running may still hold the pipes: their copies get 10 s, then are let go)
+  try { [void]$copyOut.Wait(10000) } catch { }
+  try { [void]$copyErr.Wait(10000) } catch { }
+  $outFile.Close(); $errFile.Close()
   return $process.ExitCode
 }
 
 # Inside a heavy job already (its own child): no second wait. Under CI (CI or GITHUB_ACTIONS set) a runner
 # runs one job anyway: no lock either.
-if ($env:HEAVY_QUEUE_HELD -or ($heldVariable -and [Environment]::GetEnvironmentVariable($heldVariable)) -or $env:CI -or $env:GITHUB_ACTIONS) { exit (Run-Command) }
+if (-not $travelled -and ($env:HEAVY_QUEUE_HELD -or ($heldVariable -and [Environment]::GetEnvironmentVariable($heldVariable)) -or $env:CI -or $env:GITHUB_ACTIONS)) { exit (Run-Command) }
 
+# A config made for another computer (its "computer"): on a worker, the home's folders hold the home's
+# config, and a lock run from there would queue jobs in the home's queue but hold this computer's slot.
+if ($computer -and $computer -ne $env:COMPUTERNAME)
+{
+  [Console]::Error.WriteLine("heavy: $configFile belongs to $computer, not $($env:COMPUTERNAME): run this machine's own lock.")
+  exit 2
+}
 New-Item -ItemType Directory -Force $queueDir | Out-Null
 # A machine too slow or too different for timing has ROOT\no-benchmarks: an --exclusive job is refused there
 # at once.
@@ -385,18 +483,50 @@ if ($given)
   if ($null -eq $givenSeconds) { [Console]::Error.WriteLine("heavy: --estimate takes a time such as 90s, 10m or 2h, not '$given'."); exit 2 }
 }
 $me = "pid $PID, $kind, since {0}, cwd {1}" + $(if ($thread) { ", thread " + ($thread -replace '\{', '{{' -replace '\}', '}}') }) + $(if ($null -ne $givenSeconds) { ", estimate $($givenSeconds)s" }) + ': {2}'
-$ticket = Join-Path $queueDir ('{0:D20}-{1}.txt' -f [DateTime]::UtcNow.Ticks, $PID)
+$ticketName = '{0:D20}-{1}' -f [DateTime]::UtcNow.Ticks, $PID
+$ticket = Join-Path $queueDir "$ticketName.txt"
 $queuedAt = Get-Date
 Write-Shared $ticket ($me -f $queuedAt.ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $label)
+
+# The offer, when this job may travel (lock\travel.ps1); the reason it may not, otherwise.
+$offer = ''
+$stayReason = ''
+if (-not $travelled)
+{
+  $stayReason = Travel-Refusal (Get-Location).Path $line $exclusive $stayHere $mayTravel
+  if (-not $stayReason)
+  {
+    New-Item -ItemType Directory -Force $travelDir | Out-Null
+    Clear-Dead-Offers
+    $guess = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
+    $job = [ordered]@{ id = $ticketName; machine = $machine; pid = $PID; cwd = (Get-Location).Path; line = $line; label = $label; kind = $kind; thread = $thread
+      estimate = $(if ($guess) { $guess.seconds } else { $null }); queued = (Iso $queuedAt); fingerprint = (Fingerprint); env = (Travel-Environment) }
+    Beat (Travel-File $ticketName 'waiting') 'waiting'
+    Write-Shared (Travel-File $ticketName 'job.json') ($job | ConvertTo-Json -Depth 3 -Compress)
+    $offer = $ticketName
+    $offeredAt = Get-Date
+  }
+  elseif (@($travelRoots).Count -gt 0)
+  {
+    New-Item -ItemType Directory -Force $travelDir | Out-Null
+    Write-Shared (Travel-File $ticketName 'stays') $stayReason
+  }
+}
 Write-Page
 
+# Whether no live waiter is ahead of this one. A waiter parked by Folder-Busy (its ROOT\travel\ID.parked)
+# is not ahead of anyone: it cannot start anyway, and the jobs behind it go on.
 function First-In-Queue
 {
   foreach ($w in @(Get-ChildItem $queueDir -File -ErrorAction SilentlyContinue | Sort-Object Name))
   {
     $id = [int](($w.BaseName -split '-')[1])
     if ($id -eq $PID) { return $true }
-    if (Alive $id) { return $false }
+    if (Alive $id)
+    {
+      if (Test-Path (Join-Path $travelDir "$($w.BaseName).parked")) { continue }
+      return $false
+    }
     Remove-Item $w.FullName -Force -ErrorAction SilentlyContinue
   }
   return $true
@@ -415,21 +545,70 @@ function Machine-Held
   return $null
 }
 
+# A job of this machine that runs elsewhere now in this job's folder (or one inside the other), or for the
+# same thread: this one waits for it, as two jobs of one folder or of one thread never run at once.
+function Folder-Busy
+{
+  foreach ($claim in @(Get-ChildItem $travelDir -Filter '*.claim' -File -ErrorAction SilentlyContinue))
+  {
+    $id = $claim.Name -replace '\.claim$', ''
+    if ($id -eq $offer) { continue }
+    $who = Read-Small $claim.FullName
+    if (-not $who -or $who -eq $machine -or (Test-Path (Travel-File $id 'exit'))) { continue }
+    $other = Read-Small (Travel-File $id 'job.json')
+    if (-not $other) { continue }
+    $o = $other | ConvertFrom-Json
+    if (Folders-Overlap $o.cwd (Get-Location).Path) { return "its folder is busy with a job on $who" }
+    if ($thread -and $o.thread -eq $thread) { return "its thread has a job running on $who" }
+  }
+  return $null
+}
+
 $mutex = New-Object System.Threading.Mutex($false, $mutexName)
 $held = $false
+$elsewhere = ''
+$stopWhy = ''
+$killWithMe = $false
 $said = ''
 $code = 1
 try
 {
   while (-not $held)
   {
+    if ($travelled) { Beat (Travel-File $travelled.id 'alive') 'waiting' }
+    if ($offer)
+    {
+      # (the offer names the tools of now: refreshed every 5 minutes while it waits)
+      if (((Get-Date) - $offeredAt).TotalMinutes -ge 5)
+      {
+        $job.fingerprint = Fingerprint
+        Write-Shared (Travel-File $offer 'job.json') ($job | ConvertTo-Json -Depth 3 -Compress)
+        $offeredAt = Get-Date
+      }
+      Beat (Travel-File $offer 'waiting') 'waiting'
+      $who = Read-Small (Travel-File $offer 'claim')
+      if ($who -and $who -ne $machine) { $elsewhere = $who; break }
+    }
     $why = $null
-    if (-not (First-In-Queue)) { $why = 'queued behind an earlier job' }
+    if (@($travelRoots).Count -gt 0)
+    {
+      # (parked first: a job that waits for its folder or thread elsewhere does not hold up the line)
+      $why = Folder-Busy
+      $parked = Travel-File $ticketName 'parked'
+      if ($why) { if (-not (Test-Path $parked)) { Write-Shared $parked $why } } else { Remove-Item $parked -Force -ErrorAction SilentlyContinue }
+    }
+    if (-not $why -and -not (First-In-Queue)) { $why = 'queued behind an earlier job' }
     if (-not $why) { $why = Machine-Held }
     if (-not $why)
     {
       try { $held = $mutex.WaitOne(2000) } catch [System.Threading.AbandonedMutexException] { $held = $true }
       if (-not $held) { $why = 'the heavy slot is taken' }
+    }
+    # This machine claims its own job before running it: a worker that claimed it first runs it instead.
+    if ($held -and $offer -and -not (Try-Claim (Travel-File $offer 'claim') $machine))
+    {
+      $who = Read-Small (Travel-File $offer 'claim')
+      if ($who -ne $machine) { $mutex.ReleaseMutex(); $held = $false; $elsewhere = $who; break }
     }
     if ($held) { break }
     $holder = if (Test-Path $holderFile) { (Get-Content -Raw $holderFile -ErrorAction SilentlyContinue).Trim() } else { '' }
@@ -440,51 +619,80 @@ try
   Remove-Item $ticket -Force -ErrorAction SilentlyContinue
   $startedAt = Get-Date
   $atStart = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
-  Write-Shared $holderFile ($me -f $startedAt.ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $label)
-  Write-Page
-
-  if ($exclusive)
+  if ($elsewhere)
   {
-    Write-Shared $flag "heavy pid $PID ($label)"
-    # Otherwise idle: total CPU under idleLoad percent (15) for idleSeconds (20) in a row; a desktop with a few
-    # apps open sits near 7%.
-    $quiet = 0
-    $said = ''
-    while ($quiet -lt $idleSeconds)
-    {
-      $load = (Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average
-      if ($load -lt $idleLoad) { $quiet += 2 } else
-      {
-        $quiet = 0
-        $now = 'heavy: exclusive, waiting for the machine to go idle'
-        if ($now -ne $said) { [Console]::Error.WriteLine("$now (load $load%)"); $said = $now }
-      }
-      Start-Sleep -Seconds 2
-    }
+    Write-Page
+    $code = Follow-Remote $offer $elsewhere
   }
-  $code = Run-Command
-  # Stopped from outside (ROOT\stopped-PID.txt says why, e.g. its machine was closed): said
-  # here, so the thread knows to run the job again, there or elsewhere.
-  $stopped = Join-Path $root "stopped-$PID.txt"
-  if (Test-Path $stopped)
+  else
   {
-    [Console]::Error.WriteLine('heavy: STOPPED: ' + ((Get-Content -Raw $stopped -ErrorAction SilentlyContinue) + '').Trim() + ' Run it again.')
-    Remove-Item $stopped -Force -ErrorAction SilentlyContinue
-    if ($code -eq 0) { $code = 1 }
+    Write-Shared $holderFile ($me -f $startedAt.ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $label)
+    Write-Page
+    if ($exclusive)
+    {
+      Write-Shared $flag "heavy pid $PID ($label)"
+      # Otherwise idle: total CPU under idleLoad percent (15) for idleSeconds (20) in a row; a desktop with a
+      # few apps open sits near 7%.
+      $quiet = 0
+      $said = ''
+      while ($quiet -lt $idleSeconds)
+      {
+        if ($travelled) { Beat (Travel-File $travelled.id 'alive') 'waiting for an idle machine' }
+        $load = (Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average
+        if ($load -lt $idleLoad) { $quiet += 2 } else
+        {
+          $quiet = 0
+          $now = 'heavy: exclusive, waiting for the machine to go idle'
+          if ($now -ne $said) { [Console]::Error.WriteLine("$now (load $load%)"); $said = $now }
+        }
+        Start-Sleep -Seconds 2
+      }
+    }
+    if ($travelled)
+    {
+      Beat (Travel-File $travelled.id 'alive') 'running'
+      $killWithMe = Kill-With-Me $true
+      if (-not $killWithMe) { [Console]::Error.WriteLine('heavy: no job object: a lock killed mid-job would leave the job running.') }
+    }
+    $code = Run-Command
+    # Stopped from outside (ROOT\stopped-PID.txt says why, e.g. its machine was closed): said here, so the
+    # thread knows to run the job again, there or elsewhere.
+    $stopped = Join-Path $root "stopped-$PID.txt"
+    if (Test-Path $stopped)
+    {
+      $stopWhy = ((Get-Content -Raw $stopped -ErrorAction SilentlyContinue) + '').Trim()
+      Remove-Item $stopped -Force -ErrorAction SilentlyContinue
+    }
+    elseif ($script:abandoned) { $stopWhy = "its home ($($travelled.machine)) stopped waiting for it." }
+    if ($stopWhy)
+    {
+      $message = "heavy: STOPPED: $stopWhy Run it again."
+      if ($travelled) { try { Add-Content -Path (Travel-File $travelled.id 'err') -Value $message } catch { } } else { [Console]::Error.WriteLine($message) }
+      if ($code -eq 0) { $code = 1 }
+    }
   }
 }
 finally
 {
   Remove-Item $ticket -Force -ErrorAction SilentlyContinue
-  if ($held)
+  if ($travelled)
   {
-    if ($exclusive) { Remove-Item $flag -Force -ErrorAction SilentlyContinue }
-    Remove-Item $holderFile -Force -ErrorAction SilentlyContinue
-    $mutex.ReleaseMutex()
+    if ($killWithMe) { [void](Kill-With-Me $false) }
+    Write-Shared (Travel-File $travelled.id 'exit') "$code$(if ($stopWhy) { ' stopped' })"
+  }
+  if ($held -or $elsewhere)
+  {
+    if ($held)
+    {
+      if ($exclusive) { Remove-Item $flag -Force -ErrorAction SilentlyContinue }
+      Remove-Item $holderFile -Force -ErrorAction SilentlyContinue
+      $mutex.ReleaseMutex()
+    }
     $clean = ($label -replace "[`t`r`n]", ' ')
-    $record = @($queuedAt.ToString('s'), $startedAt.ToString('s'), (Get-Date).ToString('s'), "$code", $kind, (Get-Location).Path, $clean, $thread, $(if ($atStart) { "$($atStart.seconds) $($atStart.basis)" } else { '' })) -join "`t"
+    $record = @($queuedAt.ToString('s'), $startedAt.ToString('s'), (Get-Date).ToString('s'), "$code", $kind, (Get-Location).Path, $clean, $thread, $(if ($atStart) { "$($atStart.seconds) $($atStart.basis)" } else { '' }), $elsewhere) -join "`t"
     try { Add-Content -Path $historyFile -Encoding UTF8 -Value $record } catch { }
   }
+  if (-not $travelled) { Remove-Travel $ticketName }
   $mutex.Dispose()
   Write-Page
 }

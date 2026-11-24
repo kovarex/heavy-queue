@@ -49,6 +49,7 @@ function est(j) { return j.estimate == null ? '' : d(j.estimate) + ' (' + (j.bas
 function hm(ms) { var v = new Date(ms), two = function (n) { return String(n).padStart(2, '0'); };
   return '~' + (new Date().toDateString() === v.toDateString() ? '' : two(v.getMonth() + 1) + '-' + two(v.getDate()) + ' ') + two(v.getHours()) + ':' + two(v.getMinutes()); }
 function cell(row, text, cls) { var c = row.insertCell(); c.textContent = text == null ? '' : String(text); if (cls) c.className = cls; return c; }
+function note(c, text) { if (!text) return; var n = document.createElement('span'); n.className = 'muted'; n.textContent = ' ' + text; c.appendChild(n); }
 function none(body, columns, text) { var r = body.insertRow(); var c = cell(r, text, 'none'); c.colSpan = columns; }
 function password() { try { return localStorage.getItem('heavyControl'); } catch (e) { return null; } }
 function unlock() { var f = document.getElementById('login'); f.style.display = f.style.display === 'none' ? 'block' : 'none'; if (f.style.display === 'block') document.getElementById('loginPassword').focus(); }
@@ -79,6 +80,7 @@ function draw(all) {
     if (m.seen) { var ago = (Date.now() - new Date(m.seen)) / 1000; if (!isNaN(ago)) line.textContent += ago > 90 ? ' (offline? last seen ' + d(ago) + ' ago)' : ''; }
     card.appendChild(line);
     if (s.held && m.open) { var held = document.createElement('div'); held.className = 'bad'; held.textContent = 'held: ' + s.held; card.appendChild(held); }
+    if (s.worker) { var work = document.createElement('div'); work.className = 'muted'; work.textContent = s.worker; card.appendChild(work); }
     var gated = m.gated || !!m.seen;
     if (gated && password()) {
       var add = function (text, value, title) { var b = document.createElement('button'); b.textContent = text; b.title = title; b.style.marginRight = '6px';
@@ -92,7 +94,8 @@ function draw(all) {
       if (s.running.estimate == null) { cell(r, ''); next = null; }
       else { var end = new Date(s.running.since).getTime() + s.running.estimate * 1000;
         cell(r, end < Date.now() ? 'over by ' + d((Date.now() - end) / 1000) : hm(end)); if (next != null) next = Math.max(next, end); } }
-    (s.queue || []).forEach(function (q, i) { var r = queue.insertRow(); cell(r, m.name); cell(r, i + 1); cell(r, q.kind, q.kind); cell(r, q.thread || q.folder); cell(r, q.label, 'cmd'); cell(r, t(q.since));
+    (s.queue || []).forEach(function (q, i) { var r = queue.insertRow(); cell(r, m.name); cell(r, i + 1); cell(r, q.kind, q.kind); cell(r, q.thread || q.folder);
+      note(cell(r, q.label, 'cmd'), q.travel ? '(may travel)' : q.stays ? '(stays here: ' + q.stays + ')' : ''); cell(r, t(q.since));
       cell(r, '').dataset.since = q.since; cell(r, est(q));
       if (next == null) cell(r, !m.open ? 'machine closed' : s.held ? 'held' : '', 'muted');
       else { var from = next; next = q.estimate == null ? null : next + q.estimate * 1000; cell(r, hm(from) + (next == null ? '' : ' - ' + hm(next))); } });
@@ -101,7 +104,8 @@ function draw(all) {
   if (!running.rows.length) none(running, 8, 'nothing running');
   if (!queue.rows.length) none(queue, 9, 'nobody waiting');
   ended.sort(function (a, b) { return new Date(b.ended) - new Date(a.ended); });
-  ended.slice(0, 200).forEach(function (f) { var r = finished.insertRow(); cell(r, f.machine); cell(r, f.kind, f.kind); cell(r, f.thread || f.folder); cell(r, f.label, 'cmd'); cell(r, t(f.started, true));
+  ended.slice(0, 200).forEach(function (f) { var r = finished.insertRow(); cell(r, f.machine); cell(r, f.kind, f.kind); cell(r, f.thread || f.folder);
+    note(cell(r, f.label, 'cmd'), f.ranOn ? '(ran on ' + f.ranOn + ')' : ''); cell(r, t(f.started, true));
     cell(r, d((new Date(f.started) - new Date(f.queued)) / 1000)); cell(r, d((new Date(f.ended) - new Date(f.started)) / 1000)); cell(r, est(f)); cell(r, f.exit, f.exit === 0 ? 'ok' : 'bad'); });
   if (!ended.length) none(finished, 9, 'none yet');
   var links = document.getElementById('pages'); links.innerHTML = '';
