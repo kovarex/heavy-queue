@@ -59,6 +59,18 @@ function Write-Shared([string]$path, [string]$text)
   }
 }
 
+# A status file put in place by renaming a new one over it, tried again for up to 2 seconds: two jobs writing
+# their pages at once, or a reader of the old one, made the rename fail ("Cannot create a file when that
+# file already exists", 2026-11-24).
+function Move-Over([string]$from, [string]$to)
+{
+  for ($i = 0; ; $i++)
+  {
+    try { Move-Item -Force -LiteralPath $from -Destination $to; return }
+    catch { if ($i -ge 20) { Remove-Item -LiteralPath $from -Force -ErrorAction SilentlyContinue; throw }; Start-Sleep -Milliseconds 100 }
+  }
+}
+
 function Alive([int]$id) { return $null -ne (Get-Process -Id $id -ErrorAction SilentlyContinue) }
 
 function Show-Status
@@ -353,7 +365,7 @@ tick(); setInterval(tick, 1000);
 "@
     $temp = "$pageFile.$PID.tmp"
     [IO.File]::WriteAllText($temp, $page, (New-Object System.Text.UTF8Encoding($false)))
-    Move-Item -Force $temp $pageFile
+    Move-Over $temp $pageFile
     # The same as markdown (status.md), for reading in a terminal or an editor.
     $noneQueue = if ($mdQueue.Length) { '' } else { "| | nobody waiting | | | | | | |`n" }
     $text = "# $title`n`nWritten $($now.ToString('yyyy-MM-dd HH:mm:ss')) (this machine's times; durations as of then).`n`n" +
@@ -371,9 +383,9 @@ tick(); setInterval(tick, 1000);
     $json = ($whole | ConvertTo-Json -Depth 4 -Compress)
     $jsonFile = Join-Path $root 'status.json'
     [IO.File]::WriteAllText("$jsonFile.$PID.tmp", $json, (New-Object System.Text.UTF8Encoding($false)))
-    Move-Item -Force "$jsonFile.$PID.tmp" $jsonFile
+    Move-Over "$jsonFile.$PID.tmp" $jsonFile
     [IO.File]::WriteAllText("$mdFile.$PID.tmp", $text, (New-Object System.Text.UTF8Encoding($false)))
-    Move-Item -Force "$mdFile.$PID.tmp" $mdFile
+    Move-Over "$mdFile.$PID.tmp" $mdFile
     if (Test-Path (Join-Path $root 'publish.txt'))
     {
       Start-Process powershell -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$repo\machine\publish.ps1`"")
