@@ -33,7 +33,9 @@ $clone = Split-Path $PSScriptRoot
 
 # 1. The sign-in for the home's shares.
 # (only the shares share-home.ps1 made: their comment says heavy-queue)
-function Home-Shares { return @(net view "\\$HomeName" 2>$null | Where-Object { $_ -match '^(\S+)\s+Disk.*heavy-queue' } | ForEach-Object { ($_ -split '\s+')[0] }) }
+# (through cmd: "access denied" before the sign-in is stored is an answer, and PowerShell 5.1 with
+# ErrorActionPreference Stop would make net's stderr an error even when sent to $null)
+function Home-Shares { return @(& $env:ComSpec /d /c "net view \\$HomeName 2>nul" | Where-Object { $_ -match '^(\S+)\s+Disk.*heavy-queue' } | ForEach-Object { ($_ -split '\s+')[0] }) }
 $shares = Home-Shares
 if ($shares.Count -eq 0)
 {
