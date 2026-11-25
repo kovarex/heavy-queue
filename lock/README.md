@@ -136,6 +136,7 @@ default:
 | shortestFirst | the line's order: smallest estimate plus queue time first (a job's wait counts off its estimate, so nobody starves); false: first come, first served | true |
 | unknownEstimate | the estimate, in seconds, of a job nothing is known about | 3600 |
 | priorityPaths | jobs from folders under these (or with HEAVY_QUEUE_PRIORITY set) go before every other job, in the same order among themselves | none |
+| priorityPattern | a regular expression: jobs (not `--exclusive` ones) whose name or command line matches it go first too, such as gates others wait on | none |
 | travelTools | folders a worker takes from its home when its own differ, mirrored at the same path (such as a compiler installed from an unreleased build); setup-worker.ps1 -Tools gives the worker's user those folders | none |
 | travelCheckouts | on a worker, for testing two machines on one computer: where its checkouts go instead of the homes' paths | none |
 | travelStale | seconds without a heartbeat before the other side of a travelled job counts as gone | 90 |

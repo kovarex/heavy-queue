@@ -586,9 +586,11 @@ $queuedTicks = if ($env:HEAVY_QUEUE_SINCE -match '^\d{1,20}$') { [long]$env:HEAV
 Remove-Item Env:\HEAVY_QUEUE_SINCE -ErrorAction SilentlyContinue
 $ticketName = '{0:D20}-{1}' -f $queuedTicks, $PID
 $queueGuess = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
-# (a first job, from a folder under priorityPaths or with HEAVY_QUEUE_PRIORITY set, goes before every other:
+# (a first job, from a folder under priorityPaths, whose name or command line matches priorityPattern (never an
+# --exclusive one), or with HEAVY_QUEUE_PRIORITY set, goes before every other:
 # among such jobs the order is the same as among the rest)
 $priorityJob = [bool]$env:HEAVY_QUEUE_PRIORITY
+if ($priorityPattern -and -not $exclusive -and "$label $line" -match $priorityPattern) { $priorityJob = $true }
 foreach ($f in @($priorityPaths)) { $fk = ([IO.Path]::GetFullPath("$f").TrimEnd('\') + '\').ToLowerInvariant(); if ((((Get-Location).Path.TrimEnd('\') + '\').ToLowerInvariant()).StartsWith($fk)) { $priorityJob = $true } }
 $ticket = Join-Path $queueDir ("$ticketName-e{0}{1}.txt" -f $(if ($queueGuess) { [int]$queueGuess.seconds } else { [int]$unknownEstimate }), $(if ($priorityJob) { '-p' } else { '' }))
 $queuedAt = ([DateTime]::new($queuedTicks, [DateTimeKind]::Utc)).ToLocalTime()
