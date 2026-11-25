@@ -570,14 +570,15 @@ $offer = ''
 if (-not $travelled)
 {
   # (every job may travel but an --exclusive one: a timing run's numbers belong to this machine unless it asks)
-  $stayReason = Travel-Refusal (Get-Location).Path $line $stayHere ($mayTravel -or ($travelByDefault -and ((-not $exclusive) -or $travelExclusive)))
+  $plan = Travel-Plan (Get-Location).Path $line $stayHere ($mayTravel -or ($travelByDefault -and ((-not $exclusive) -or $travelExclusive)))
+  $stayReason = $plan.Why
   if (-not $stayReason)
   {
     New-Item -ItemType Directory -Force $travelExchange | Out-Null
     Clear-Dead-Offers
     $guess = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
     $job = [ordered]@{ id = $ticketName; machine = $machine; pid = $PID; cwd = (Get-Location).Path; line = $line; label = $label; kind = $kind; thread = $thread
-      estimate = $(if ($guess) { $guess.seconds } else { $null }); queued = (Iso $queuedAt); fingerprintCommands = @($fingerprintCommands); tools = (Offer-Tools); fingerprint = (Fingerprint); env = (Travel-Environment); held = $heldVariable }
+      estimate = $(if ($guess) { $guess.seconds } else { $null }); queued = (Iso $queuedAt); fingerprintCommands = @($fingerprintCommands); tools = (Offer-Tools); fingerprint = (Fingerprint); env = (Travel-Environment); held = $heldVariable; folders = @($plan.Folders) }
     Beat (Travel-File $ticketName 'waiting') 'waiting'
     Write-Shared (Travel-File $ticketName 'job.json') ($job | ConvertTo-Json -Depth 3 -Compress)
     $offer = $ticketName
@@ -673,7 +674,7 @@ try
     }
     if (-not $elsewhere) { break }
     # A worker claimed it: the checkout's state goes over, unless something keeps the job here.
-    $refusedWhy = Pack-State $offer (Get-Location).Path
+    $refusedWhy = Pack-State $offer (Get-Location).Path $plan.Folders
     if ($refusedWhy)
     {
       [Console]::Error.WriteLine("heavy: stays here after all ($refusedWhy).")
@@ -684,7 +685,7 @@ try
     $startedAt = Get-Date
     $atStart = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
     Write-Page
-    $result = Follow-Remote $offer $elsewhere (Git-Top (Get-Location).Path)
+    $result = Follow-Remote $offer $elsewhere $plan.Folders
     if ($null -ne $result) { $code = $result; $ranElsewhere = $true; break }
     # Not run there (the worker could not make the checkout): here after all, in its place in the line.
     [Console]::Error.WriteLine("heavy: $elsewhere did not run it: it runs here.")
@@ -703,10 +704,12 @@ try
     {
       # The home's state (it packs it once it sees the claim), then the checkout made from it.
       $waitedFrom = Get-Date
+      Write-Have $travelled.id $travelled.folders
       while (-not (Test-Path (Travel-File $travelled.id 'ready')) -and -not (Test-Path (Travel-File $travelled.id 'refused')))
       {
         Beat (Travel-File $travelled.id 'alive') 'waiting for the home''s state'
-        if (((Get-Date) - $waitedFrom).TotalSeconds -gt $travelStale + 30) { break }
+        # (the home beats its waiting file while it packs, which can take minutes)
+        if (((Get-Date) - $waitedFrom).TotalSeconds -gt $travelStale + 30 -and -not (Fresh (Travel-File $travelled.id 'waiting'))) { break }
         Start-Sleep -Seconds 1
       }
       if (-not (Test-Path (Travel-File $travelled.id 'ready')))
@@ -719,7 +722,7 @@ try
         {
           Beat (Travel-File $travelled.id 'alive') 'making its checkout'
           $here = Prepare-Checkout $travelled.id
-          $before = Snapshot-Files $script:workerTop
+          $before = Snapshot-Files $script:workerFolders
           Set-Location -LiteralPath $here
         }
         catch
@@ -762,7 +765,7 @@ try
       $code = Run-Command
       if ($travelled -and $before)
       {
-        try { Beat (Travel-File $travelled.id 'alive') 'sending its files back'; $backNote = Pack-Back $travelled.id $script:workerTop $before; [Console]::Error.WriteLine("heavy: $backNote") }
+        try { Beat (Travel-File $travelled.id 'alive') 'sending its files back'; $backNote = Pack-Back $travelled.id $script:workerFolders $before; [Console]::Error.WriteLine("heavy: $backNote") }
         catch { try { Add-Content -Path (Travel-File $travelled.id 'err') -Value "heavy: the job's files could not go back: $($_.Exception.Message)" } catch { }; if ($code -eq 0) { $code = 1 } }
       }
       # Stopped from outside (ROOT\stopped-PID.txt says why, e.g. its machine was closed): said here, so the

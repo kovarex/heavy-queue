@@ -1,25 +1,27 @@
-# Jobs that travel (dot-sourced by heavy.ps1 and machine\worker.ps1). A job started with --travel from a git
-# checkout may run on another machine (a worker) while it waits here: the worker rebuilds the checkout's
-# exact state at the same path (the commit, the commits not on any remote, the uncommitted changes and the
-# new files; nothing git ignores, such as build folders) and runs the command there. Its output comes back to
-# the waiting heavy.cmd as it is written, then its exit code; no file comes back. So a job travels when its
-# result is its output and exit code (a gate, a test run) and it builds what it uses itself: a build whose
-# files the thread uses afterwards stays home. Everything goes through files in the exchange folder that
-# every machine sees (travelExchange, a NAS share):
+# Jobs that travel (dot-sourced by heavy.ps1 and machine\worker.ps1). A waiting job may run on another
+# machine (a worker) with the same tools while it waits here. Its folders (Travel-Plan: the git checkout or
+# folder it runs in, and the folders its command line and the scripts it names name) travel with it: the
+# worker keeps its own copy of each at the same path, and only what differs from that copy goes over (build
+# outputs and uncommitted files included; a git checkout's git state by git), so a second job from the same
+# folder moves little. Its output comes back to the waiting heavy.cmd as it is written, then the files it made,
+# changed or deleted in those folders, then its exit code. Everything goes through files in the exchange
+# folder that every machine sees (travelExchange, a NAS share):
 #   ID.job.json      the offer: machine, folder, command line, label, kind, thread, estimate, environment
-#                    (no secrets), the tool versions (the fingerprint commands and their output); ID is the
-#                    home's queue ticket's name
-#   ID.waiting       the home's waiter, every 3 s while it waits (a counter)
+#                    (no secrets), the tool versions (the fingerprint commands and their output), the folders;
+#                    ID is the home's queue ticket's name
+#   ID.waiting       the home's waiter, every 3 s while it waits and while it packs (a counter)
 #   ID.claim         the machine that runs it, made with CreateNew: whoever makes it first runs the job, the
 #                    home included (it claims its own job before running it locally)
-#   ID.state.json    the checkout's state, written by the home once claimed: its top folder, commit, branch,
-#   ID.bundle        remotes and remote branches, with the commits no remote has (a git bundle),
-#   ID.patch         the uncommitted changes (git diff --binary HEAD) and
-#   ID.new.tar       the new files git does not ignore; then
+#   ID.have.N, .have what the worker's copy of folder N holds (gzipped list), then how many folders
+#   ID.fN.tar, .del  the files of folder N that differ there (to write) and that are not here (to delete),
+#   ID.fN.bundle     a checkout's commits no remote has,
+#   ID.state.json    per folder: which of those exist, its git state (commit, branch, remotes, remote
+#                    branches); then
 #   ID.ready         (or ID.refused, the reason the job runs at home after all)
 #   ID.alive         the worker, every 5 s (a counter and what it is doing)
 #   ID.watch         the home's waiter, every 3 s while the job runs elsewhere (a counter)
 #   ID.out, ID.err   the job's output
+#   ID.bN.tar, .del  the files the job made or changed, and deleted, in folder N
 #   ID.exit          its exit code, then why when it did not finish ("1 stopped: ...")
 # ROOT\travel (this machine's own) keeps why a waiting job stays home (ID.stays), for the pages.
 # A worker takes a job only with the same fingerprint, and no --exclusive one on a no-benchmarks machine. A
@@ -73,31 +75,81 @@ function Git-Top([string]$folder)
   return $r.Out.Trim().Replace('/', '\')
 }
 
-# Why this job may not travel, or '' when it may.
-function Travel-Refusal([string]$cwd, [string]$commandLine, [bool]$forbid, [bool]$allow)
+# The folders a job uses, which travel with it: its own (the git checkout it is in, or its folder) and each
+# folder the command line names, and the scripts it names name (one level down). A path under one of
+# travelFolderRoots stands for that root's folder it is in (C:\kpp-sandbox\scratch\x\y: C:\kpp-sandbox\scratch\x);
+# else for its git checkout, else for its own folder. Paths under samePaths are the same on every machine and
+# do not travel; only paths that exist here count. Returns the folders, or the reason the job stays here.
+function Travel-Folder([string]$path)
 {
-  if ($forbid) { return '--local' }
-  if (-not $allow) { return 'it travels only with --travel here (travelByDefault, travelExclusive in the config)' }
-  if (-not $travelExchange) { return 'no travelExchange in the config' }
-  $top = Git-Top $cwd
-  if (-not $top) { return 'its folder is in no git checkout' }
-  $expanded = [Environment]::ExpandEnvironmentVariables($commandLine)
+  if (Under-Any $path $samePaths) { return '' }
+  # (the lock's own folders: its data folder and its clone are this machine's, never a job's)
+  if (Under-Any $path @($root, (Split-Path $PSScriptRoot))) { return '' }
+  $key = Folder-Key $path
+  if (-not $key) { return '' }
+  foreach ($r in @($travelFolderRoots))
+  {
+    $rk = Folder-Key "$r"
+    if ($rk -and $key.StartsWith($rk))
+    {
+      $rest = $key.Substring($rk.Length).Trim('\')
+      if (-not $rest) { return "!it names $r itself" }
+      $first = ($rest -split '\\')[0]
+      return ([IO.Path]::GetFullPath($path.Replace('/', '\'))).Substring(0, $rk.Length + $first.Length)
+    }
+  }
+  $folder = if (Test-Path -LiteralPath $path -PathType Container) { $path } else { Split-Path $path }
+  $top = Git-Top $folder
+  if ($top) { $folder = $top }
+  $folder = [IO.Path]::GetFullPath($folder).TrimEnd('\')
+  if (@($folder -split '\\' | Where-Object { $_ }).Count -lt 3) { return "!it names $path, whose folder $folder is too wide to travel" }
+  return $folder
+}
+
+function Travel-Paths([string]$text, [string]$cwd)
+{
+  $paths = New-Object System.Collections.ArrayList
+  $expanded = [Environment]::ExpandEnvironmentVariables($text)
   foreach ($m in [regex]::Matches($expanded, '"([^"]*)"|([^\s"]+)'))
   {
     $token = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }
-    $paths = New-Object System.Collections.ArrayList
-    if ($m.Groups[1].Success -and $token -match '^([A-Za-z]:[\\/]|\\\\)') { [void]$paths.Add($token) }
-    else
+    if ($m.Groups[1].Success -and $token -match '^([A-Za-z]:[\\/]|\\\\)') { [void]$paths.Add($token); continue }
+    $found = $false
+    foreach ($p in [regex]::Matches($token, '(?<![A-Za-z])([A-Za-z]:[\\/][^\s"''<>|&()=,;*?]*)|(\\\\[^\s"''<>|&()=,;*?]+)')) { $v = $p.Value.TrimEnd('.', '\', '/'); if ($v -match '^[A-Za-z]:$') { $v += '\' }; [void]$paths.Add($v); $found = $true }
+    if (-not $found -and $cwd -and $token -match '[\\/]' -and $token -notmatch '^[-/]') { [void]$paths.Add((Join-Path $cwd ($token -replace '^.*?=', ''))) }
+  }
+  return ,$paths
+}
+
+function Travel-Plan([string]$cwd, [string]$commandLine, [bool]$forbid, [bool]$allow)
+{
+  if ($forbid) { return [pscustomobject]@{ Why = '--local'; Folders = @() } }
+  if (-not $allow) { return [pscustomobject]@{ Why = 'it travels only with --travel here (travelByDefault, travelExclusive in the config)'; Folders = @() } }
+  if (-not $travelExchange) { return [pscustomobject]@{ Why = 'no travelExchange in the config'; Folders = @() } }
+  $folders = New-Object System.Collections.ArrayList
+  $todo = New-Object System.Collections.ArrayList
+  [void]$todo.Add($cwd)
+  $scripts = @()
+  foreach ($p in (Travel-Paths $commandLine $cwd)) { [void]$todo.Add($p) }
+  # (the scripts the command line names, read for the paths they name: one level, 64 KB each at most)
+  foreach ($p in @($todo))
+  {
+    if ($p -match '\.(cmd|bat|ps1|py|sh)$' -and (Test-Path -LiteralPath $p -PathType Leaf) -and (Get-Item -LiteralPath $p).Length -lt 65536)
     {
-      foreach ($p in [regex]::Matches($token, '(?<![A-Za-z])([A-Za-z]:[\\/][^\s"<>|&()=,;]*)|(\\\\[^\s"<>|&()=,;]+)')) { [void]$paths.Add($p.Value) }
-      if ($paths.Count -eq 0 -and $token -match '\.\.[\\/]') { [void]$paths.Add((Join-Path $cwd ($token -replace '^.*?=', ''))) }
-    }
-    foreach ($p in $paths)
-    {
-      if (-not (Under-Any $p @($top)) -and -not (Under-Any $p $samePaths)) { return "it names $p, outside its checkout ($top)" }
+      foreach ($q in (Travel-Paths ([IO.File]::ReadAllText($p)) '')) { [void]$todo.Add($q) }
     }
   }
-  return ''
+  foreach ($p in $todo)
+  {
+    if (-not (Test-Path -LiteralPath $p)) { continue }
+    $f = Travel-Folder $p
+    if (-not $f) { continue }
+    if ($f.StartsWith('!')) { return [pscustomobject]@{ Why = $f.Substring(1); Folders = @() } }
+    if (-not ($folders | Where-Object { $_ -eq $f })) { [void]$folders.Add($f) }
+  }
+  # (a folder inside another travels with it)
+  $kept = @($folders | Where-Object { $f = $_; -not ($folders | Where-Object { $_ -ne $f -and (Folder-Key $f).StartsWith((Folder-Key $_)) }) })
+  return [pscustomobject]@{ Why = ''; Folders = $kept }
 }
 
 # The environment a travelling job takes along: everything but what names this machine, its own folders
@@ -302,10 +354,10 @@ function Fresh([string]$path)
   return (($now - $last.Since).TotalSeconds -lt $travelStale)
 }
 
-$travelExts = 'job.json', 'stays', 'waiting', 'claim', 'state.json', 'bundle', 'patch', 'new.tar', 'ready', 'refused', 'alive', 'watch', 'out', 'err', 'back.tar', 'back.deleted', 'exit'
 function Remove-Travel([string]$id)
 {
-  foreach ($ext in $travelExts) { Remove-Item (Travel-File $id $ext) -Force -ErrorAction SilentlyContinue }
+  Remove-Item (Join-Path $travelExchange "$id.*") -Force -ErrorAction SilentlyContinue
+  Remove-Item (Travel-File $id 'stays') -Force -ErrorAction SilentlyContinue
 }
 
 # The travel files of this machine's jobs whose waiter died: gone, unless a worker still runs the job (it
@@ -324,66 +376,202 @@ function Clear-Dead-Offers
   }
 }
 
-# The home's side, once a worker claimed its job: the checkout's state into the exchange. Returns '' when it
-# is ready, else why the job runs here after all (ID.refused tells the worker).
-function Pack-State([string]$id, [string]$cwd)
+# Folder lists: every file under a folder with its size and time (seconds: what tar keeps), but the folder's
+# own .git (a checkout's git state travels by git) and what reparse points lead to (a junction is never
+# followed). Kept gzipped in the exchange: ID.have.N (the worker's copy of folder N before the job).
+if (-not ('HeavyQueueFiles' -as [type]))
+{
+  Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Text;
+public static class HeavyQueueFiles
+{
+  // null when the folder holds more than max files.
+  public static Dictionary<string, string> Scan(string root, int max)
+  {
+    var files = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    root = Path.GetFullPath(root).TrimEnd('\\');
+    if (!Directory.Exists(root)) return files;
+    int baseLength = root.Length + 1;
+    var stack = new Stack<string>();
+    stack.Push(root);
+    while (stack.Count > 0)
+    {
+      string dir = stack.Pop();
+      bool top = dir.Length == root.Length;
+      foreach (FileSystemInfo e in new DirectoryInfo(dir).EnumerateFileSystemInfos())
+      {
+        if ((e.Attributes & FileAttributes.ReparsePoint) != 0) continue;
+        if (top && string.Equals(e.Name, ".git", StringComparison.OrdinalIgnoreCase)) continue;
+        if ((e.Attributes & FileAttributes.Directory) != 0) { stack.Push(e.FullName); continue; }
+        FileInfo f = (FileInfo)e;
+        files[f.FullName.Substring(baseLength)] = f.Length + "|" + (f.LastWriteTimeUtc.Ticks / 10000000);
+        if (files.Count > max) return null;
+      }
+    }
+    return files;
+  }
+  public static void Write(string path, Dictionary<string, string> files)
+  {
+    using (var gz = new GZipStream(File.Create(path), CompressionLevel.Fastest))
+    using (var w = new StreamWriter(gz, new UTF8Encoding(false)))
+      foreach (var kv in files) { w.Write(kv.Key); w.Write('\t'); w.Write(kv.Value); w.Write('\n'); }
+  }
+  public static Dictionary<string, string> Read(string path)
+  {
+    var files = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    if (!File.Exists(path)) return files;
+    using (var gz = new GZipStream(File.OpenRead(path), CompressionMode.Decompress))
+    using (var r = new StreamReader(gz, new UTF8Encoding(false)))
+    {
+      string line;
+      while ((line = r.ReadLine()) != null) { int t = line.IndexOf('\t'); if (t > 0) files[line.Substring(0, t)] = line.Substring(t + 1); }
+    }
+    return files;
+  }
+  // The files of mine that theirs lacks or has otherwise (to send), and theirs that mine lacks (to delete).
+  public static string[][] Diff(Dictionary<string, string> mine, Dictionary<string, string> theirs, out long bytes)
+  {
+    var send = new List<string>(); var delete = new List<string>(); bytes = 0;
+    foreach (var kv in mine)
+    {
+      string v;
+      if (!theirs.TryGetValue(kv.Key, out v) || v != kv.Value) { send.Add(kv.Key); bytes += long.Parse(kv.Value.Substring(0, kv.Value.IndexOf('|'))); }
+    }
+    foreach (var k in theirs.Keys) if (!mine.ContainsKey(k)) delete.Add(k);
+    return new string[][] { send.ToArray(), delete.ToArray() };
+  }
+}
+'@
+}
+
+# A program run to its end with a heartbeat file beaten every 2 s meanwhile (a big tar takes minutes; the
+# other side would count this one gone after travelStale seconds otherwise).
+function Run-Beating([string]$exe, [string[]]$arguments, [string]$beatFile, [string]$what)
+{
+  $info = New-Object System.Diagnostics.ProcessStartInfo
+  $info.FileName = $exe
+  $info.Arguments = (@($arguments | ForEach-Object { if ($_ -match '[\s"]' -or $_ -eq '') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
+  $info.UseShellExecute = $false
+  $info.RedirectStandardOutput = $true
+  $info.RedirectStandardError = $true
+  $info.CreateNoWindow = $true
+  $p = [System.Diagnostics.Process]::Start($info)
+  $outTask = $p.StandardOutput.ReadToEndAsync()
+  $errTask = $p.StandardError.ReadToEndAsync()
+  while (-not $p.WaitForExit(2000)) { Beat $beatFile $what }
+  $p.WaitForExit()
+  return [pscustomobject]@{ Code = $p.ExitCode; Out = $outTask.Result; Err = $errTask.Result }
+}
+
+function Write-List([string]$path, $names)
+{
+  [IO.File]::WriteAllText($path, ((@($names) | ForEach-Object { $_.Replace('\', '/') }) -join "`0"), (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# A worker's folder for one of the home's: the same path, or under travelCheckouts (testing on one computer).
+function Worker-Path([string]$path)
+{
+  if (-not $travelCheckouts) { return $path }
+  return Join-Path $travelCheckouts ($path -replace '^([A-Za-z]):', '$1')
+}
+
+# The worker's copies of homes' folders (ROOT\copies.txt): a folder in the way that is not one of them is
+# renamed aside, never deleted or written into.
+function Owned-Copies { $f = Join-Path $root 'copies.txt'; if (Test-Path $f) { return @(Get-Content $f | Where-Object { $_ }) } return @() }
+function Own-Copy([string]$folder)
+{
+  $key = Folder-Key $folder
+  if ((Owned-Copies) -notcontains $key) { [IO.File]::AppendAllText((Join-Path $root 'copies.txt'), "$key`r`n", (New-Object System.Text.UTF8Encoding($false))) }
+}
+
+# The worker's side, right after its claim: what its copy of each folder holds now (ID.have.N), then ID.have.
+function Write-Have([string]$id, $folders)
+{
+  $owned = Owned-Copies
+  $i = 0
+  foreach ($f in @($folders))
+  {
+    $here = Worker-Path $f
+    $mine = if ((Test-Path -LiteralPath $here) -and ($owned -contains (Folder-Key $here) -or (Test-Path -LiteralPath (Join-Path $here '.git\heavy-queue-worker')))) { [HeavyQueueFiles]::Scan($here, [int]::MaxValue) } else { New-Object 'System.Collections.Generic.Dictionary[string,string]' }
+    [HeavyQueueFiles]::Write((Travel-File $id "have.$i"), $mine)
+    $i++
+  }
+  Write-Shared (Travel-File $id 'have') "$i"
+}
+
+# The home's side, once a worker claimed its job and said what it has: per folder, what differs (ID.fN.tar
+# and ID.fN.del: the files to write and to delete), and for a git checkout its git state (the commit, branch,
+# remotes and remote branches, with the commits no remote has as ID.fN.bundle) so git works there as here.
+# Returns '' when it is ready, else why the job runs here after all (ID.refused tells the worker).
+function Pack-State([string]$id, [string]$cwd, $folders)
 {
   $why = ''
   try
   {
-    $top = Git-Top $cwd
-    if (-not $top) { throw 'its folder is in no git checkout now' }
-    $head = (Git $top @('rev-parse', 'HEAD')).Out.Trim()
-    $branch = (Git $top @('symbolic-ref', '--short', '-q', 'HEAD')).Out.Trim()
-    $remotes = [ordered]@{}
-    foreach ($r in ((Git $top @('remote')).Out -split "`n" | Where-Object { $_.Trim() }))
+    $waited = Get-Date
+    while (-not (Test-Path (Travel-File $id 'have')))
     {
-      $remotes[$r.Trim()] = (Git $top @('remote', 'get-url', $r.Trim())).Out.Trim()
-    }
-    if ($remotes.Count -eq 0) { throw 'its checkout has no remote to fetch from' }
-    $refs = [ordered]@{}
-    foreach ($l in ((Git $top @('for-each-ref', 'refs/remotes', '--format=%(objectname) %(refname)')).Out -split "`n" | Where-Object { $_ -match '^[0-9a-f]{40} ' }))
-    {
-      $parts = $l.Trim() -split ' ', 2
-      if ($parts[1] -notmatch '/HEAD$') { $refs[$parts[1]] = $parts[0] }
+      Beat (Travel-File $id 'waiting') 'waiting'
+      if (((Get-Date) - $waited).TotalSeconds -gt $travelStale + 30) { throw 'the worker did not say what it has' }
+      Start-Sleep -Seconds 1
     }
     $limit = [int64]$travelLimitMB * 1MB
-    # The commits no remote has.
-    $local = [int]((Git $top @('rev-list', '--count', 'HEAD', '--not', '--remotes')).Out.Trim())
-    if ($local -gt 0)
+    $total = 0L
+    $list = @()
+    $i = 0
+    foreach ($f in @($folders))
     {
-      $r = Git $top @('bundle', 'create', (Travel-File $id 'bundle'), 'HEAD', '--not', '--remotes')
-      if ($r.Code -ne 0) { throw "git bundle: $($r.Err.Trim())" }
+      Beat (Travel-File $id 'waiting') 'waiting'
+      $mine = [HeavyQueueFiles]::Scan($f, $travelMaxFiles)
+      if ($null -eq $mine) { throw "$f holds over $travelMaxFiles files (travelMaxFiles)" }
+      $theirs = [HeavyQueueFiles]::Read((Travel-File $id "have.$i"))
+      $bytes = 0L
+      $diff = [HeavyQueueFiles]::Diff($mine, $theirs, [ref]$bytes)
+      $total += $bytes
+      if ($total -gt $limit) { throw "what differs on the worker weighs over $travelLimitMB MB (travelLimitMB)" }
+      $entry = [ordered]@{ path = $f; tar = ($diff[0].Count -gt 0); del = ($diff[1].Count -gt 0); files = $diff[0].Count; deleted = $diff[1].Count; git = $null }
+      if ($diff[0].Count)
+      {
+        $names = Join-Path $env:TEMP "heavy-send-$PID.txt"
+        Write-List $names $diff[0]
+        $r = Run-Beating "$env:windir\System32\tar.exe" @('-cf', (Travel-File $id "f$i.tar"), '-C', $f, '--null', '-T', $names) (Travel-File $id 'waiting') 'waiting'
+        Remove-Item $names -Force -ErrorAction SilentlyContinue
+        if ($r.Code -ne 0) { throw "tar of $($f): $($r.Err.Trim())" }
+      }
+      if ($diff[1].Count) { [IO.File]::WriteAllLines((Travel-File $id "f$i.del"), [string[]]$diff[1], (New-Object System.Text.UTF8Encoding($false))) }
+      $top = Git-Top $f
+      if ($top -and (Folder-Key $top) -eq (Folder-Key $f))
+      {
+        $head = (Git $f @('rev-parse', 'HEAD')).Out.Trim()
+        $branch = (Git $f @('symbolic-ref', '--short', '-q', 'HEAD')).Out.Trim()
+        $remotes = [ordered]@{}
+        foreach ($r in ((Git $f @('remote')).Out -split "`n" | Where-Object { $_.Trim() })) { $remotes[$r.Trim()] = (Git $f @('remote', 'get-url', $r.Trim())).Out.Trim() }
+        if ($remotes.Count -eq 0) { throw "$f has no remote to fetch from" }
+        $refs = [ordered]@{}
+        foreach ($l in ((Git $f @('for-each-ref', 'refs/remotes', '--format=%(objectname) %(refname)')).Out -split "`n" | Where-Object { $_ -match '^[0-9a-f]{40} ' }))
+        {
+          $parts = $l.Trim() -split ' ', 2
+          if ($parts[1] -notmatch '/HEAD$') { $refs[$parts[1]] = $parts[0] }
+        }
+        $local = [int]((Git $f @('rev-list', '--count', 'HEAD', '--not', '--remotes')).Out.Trim())
+        if ($local -gt 0)
+        {
+          $r = Git $f @('bundle', 'create', (Travel-File $id "f$i.bundle"), 'HEAD', '--not', '--remotes')
+          if ($r.Code -ne 0) { throw "git bundle: $($r.Err.Trim())" }
+        }
+        $entry.git = [ordered]@{ head = $head; branch = $branch; remotes = $remotes; refs = $refs; bundle = ($local -gt 0) }
+      }
+      $list += $entry
+      $i++
     }
-    # The uncommitted changes, against HEAD (staged or not), written by git itself (bytes as they are).
-    $r = Git $top @('diff', '--binary', "--output=$(Travel-File $id 'patch')", 'HEAD')
-    if ($r.Code -ne 0) { throw "git diff: $($r.Err.Trim())" }
-    # The new files git does not ignore: their names as git writes them (NUL-separated bytes), to tar.
-    $list = Join-Path $env:TEMP "heavy-new-$PID.txt"
-    $info = New-Object System.Diagnostics.ProcessStartInfo
-    $info.FileName = 'git'
-    $info.Arguments = "-C `"$top`" ls-files --others --exclude-standard -z"
-    $info.UseShellExecute = $false
-    $info.RedirectStandardOutput = $true
-    $info.CreateNoWindow = $true
-    $p = [System.Diagnostics.Process]::Start($info)
-    $bytes = New-Object IO.MemoryStream
-    $p.StandardOutput.BaseStream.CopyTo($bytes)
-    $p.WaitForExit()
-    if ($p.ExitCode -ne 0) { throw "git ls-files: exit $($p.ExitCode)" }
-    [IO.File]::WriteAllBytes($list, $bytes.ToArray())
-    $new = (Get-Item -LiteralPath $list).Length -gt 0
-    if ($new)
-    {
-      $r = Run-Quiet "$env:windir\System32\tar.exe" @('-cf', (Travel-File $id 'new.tar'), '-C', $top, '--null', '-T', $list)
-      if ($r.Code -ne 0) { throw "tar: $($r.Err.Trim())" }
-    }
-    Remove-Item $list -Force -ErrorAction SilentlyContinue
-    $size = (Get-Item -LiteralPath (Travel-File $id 'patch')).Length
-    if ($new) { $size += (Get-Item -LiteralPath (Travel-File $id 'new.tar')).Length }
-    if ($size -gt $limit) { throw "its uncommitted state weighs $([int]($size / 1MB)) MB, over travelLimitMB ($travelLimitMB)" }
-    $state = [ordered]@{ top = $top; cwd = $cwd; head = $head; branch = $branch; remotes = $remotes; refs = $refs; bundle = ($local -gt 0); new = $new }
-    Write-Shared (Travel-File $id 'state.json') ($state | ConvertTo-Json -Depth 4 -Compress)
+    $files = 0; $gone = 0; foreach ($e in $list) { $files += $e.files; $gone += $e.deleted }
+    [Console]::Error.WriteLine("heavy: its folders go over: $files files ($([math]::Round($total / 1MB, 1)) MB) to write, $gone to delete.")
+    $state = [ordered]@{ cwd = $cwd; folders = $list }
+    Write-Shared (Travel-File $id 'state.json') ($state | ConvertTo-Json -Depth 6 -Compress)
     Write-Shared (Travel-File $id 'ready') 'ready'
   }
   catch
@@ -394,29 +582,12 @@ function Pack-State([string]$id, [string]$cwd)
   return $why
 }
 
-# A worker's folder for one of the home's: the same path, or under travelCheckouts (testing on one computer).
-function Worker-Path([string]$path)
+# A worker's git state for a checkout copy: a .git made from a bare mirror of its first remote (ROOT\mirrors,
+# so a second copy of a big repository fetches only what is new), the home's remotes, commits and remote
+# branches, HEAD at the home's commit and the index at it; the files are the home's (Pack-State's tar).
+function Set-Git([string]$here, $git, [string]$bundle)
 {
-  if (-not $travelCheckouts) { return $path }
-  return Join-Path $travelCheckouts ($path -replace '^([A-Za-z]):', '$1')
-}
-
-# The worker's side: the checkout at the home's state, at its path here; returns the job's folder here. A
-# folder in the way that is not a checkout this worker made (.git\heavy-queue-worker) is renamed aside, never
-# deleted. The remotes' commits come from a bare mirror of each remote kept in ROOT\mirrors, so a second
-# checkout of a big repository fetches only what is new.
-function Prepare-Checkout([string]$id)
-{
-  $state = (Read-Small (Travel-File $id 'state.json')) | ConvertFrom-Json
-  $top = Worker-Path $state.top
-  if ($top.Length -lt 6) { throw "refused to work at $top" }
-  $mark = Join-Path $top '.git\heavy-queue-worker'
-  if ((Test-Path -LiteralPath $top) -and -not (Test-Path -LiteralPath $mark))
-  {
-    $aside = "$top.local-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-    Rename-Item -LiteralPath $top -NewName (Split-Path -Leaf $aside)
-  }
-  $origin = @($state.remotes.PSObject.Properties)[0]
+  $origin = @($git.remotes.PSObject.Properties)[0]
   $mirror = Join-Path $root ("mirrors\" + (($origin.Value -replace '[^A-Za-z0-9]+', '-').Trim('-')) + '.git')
   if (-not (Test-Path -LiteralPath $mirror))
   {
@@ -428,99 +599,126 @@ function Prepare-Checkout([string]$id)
     $r = Git $mirror @('fetch', '--prune', '--quiet')
     if ($r.Code -ne 0) { throw "git fetch in $($mirror): $($r.Err.Trim())" }
   }
-  if (-not (Test-Path -LiteralPath $mark))
+  $dotGit = Join-Path $here '.git'
+  if ((Test-Path -LiteralPath $dotGit -PathType Leaf)) { Remove-Item -LiteralPath $dotGit -Force }
+  if (-not (Test-Path -LiteralPath $dotGit))
   {
-    New-Item -ItemType Directory -Force (Split-Path $top) | Out-Null
-    $r = Run-Quiet 'git' @('clone', '--no-checkout', '--quiet', '--reference', $mirror, $origin.Value, $top)
+    $temp = "$here.heavy-git"
+    if (Test-Path -LiteralPath $temp) { cmd /c rd /s /q "$temp" }
+    $r = Run-Quiet 'git' @('clone', '--no-checkout', '--quiet', '--reference', $mirror, $origin.Value, $temp)
     if ($r.Code -ne 0) { throw "git clone $($origin.Value): $($r.Err.Trim())" }
-    Set-Content -LiteralPath $mark -Value 'a checkout heavy-queue''s worker made: it is set to a home''s state for each job' -Encoding ascii
+    Move-Item -LiteralPath (Join-Path $temp '.git') -Destination $dotGit
+    cmd /c rd /s /q "$temp"
   }
-  foreach ($remote in $state.remotes.PSObject.Properties)
+  foreach ($remote in $git.remotes.PSObject.Properties)
   {
-    if ((Git $top @('remote', 'get-url', $remote.Name)).Code -ne 0) { [void](Git $top @('remote', 'add', $remote.Name, $remote.Value)) }
-    else { [void](Git $top @('remote', 'set-url', $remote.Name, $remote.Value)) }
-    $r = Git $top @('fetch', '--prune', '--quiet', $remote.Name)
+    if ((Git $here @('remote', 'get-url', $remote.Name)).Code -ne 0) { [void](Git $here @('remote', 'add', $remote.Name, $remote.Value)) }
+    else { [void](Git $here @('remote', 'set-url', $remote.Name, $remote.Value)) }
+    $r = Git $here @('fetch', '--prune', '--quiet', $remote.Name)
     if ($r.Code -ne 0) { throw "git fetch $($remote.Name): $($r.Err.Trim())" }
   }
-  if ($state.bundle)
+  if ($git.bundle)
   {
-    $r = Git $top @('fetch', '--quiet', (Travel-File $id 'bundle'), 'HEAD')
+    $r = Git $here @('fetch', '--quiet', $bundle, 'HEAD')
     if ($r.Code -ne 0) { throw "git fetch from the bundle: $($r.Err.Trim())" }
   }
-  # The remote branches as the home has them (a gate compares with origin/master as the home last fetched it).
-  foreach ($ref in $state.refs.PSObject.Properties)
+  foreach ($ref in $git.refs.PSObject.Properties)
   {
-    $r = Git $top @('update-ref', $ref.Name, $ref.Value)
+    $r = Git $here @('update-ref', $ref.Name, $ref.Value)
     if ($r.Code -ne 0) { throw "git update-ref $($ref.Name): $($r.Err.Trim())" }
   }
-  $r = if ($state.branch) { Git $top @('checkout', '--quiet', '--force', '-B', $state.branch, $state.head) } else { Git $top @('checkout', '--quiet', '--force', '--detach', $state.head) }
-  if ($r.Code -ne 0) { throw "git checkout $($state.head): $($r.Err.Trim())" }
-  # Nothing of the job before: no untracked or ignored file (a stale build would be tested otherwise).
-  $r = Git $top @('clean', '-ffdxq')
-  if ($r.Code -ne 0) { throw "git clean: $($r.Err.Trim())" }
-  $patch = Travel-File $id 'patch'
-  if ((Get-Item -LiteralPath $patch).Length -gt 0)
+  if ($git.branch)
   {
-    $r = Git $top @('apply', '--binary', '--whitespace=nowarn', $patch)
-    if ($r.Code -ne 0) { throw "git apply: $($r.Err.Trim())" }
+    $r = Git $here @('update-ref', "refs/heads/$($git.branch)", $git.head)
+    if ($r.Code -ne 0) { throw "git update-ref $($git.branch): $($r.Err.Trim())" }
+    [void](Git $here @('symbolic-ref', 'HEAD', "refs/heads/$($git.branch)"))
   }
-  if ($state.new)
+  else
   {
-    $r = Run-Quiet "$env:windir\System32\tar.exe" @('-xf', (Travel-File $id 'new.tar'), '-C', $top)
-    if ($r.Code -ne 0) { throw "tar: $($r.Err.Trim())" }
+    $r = Git $here @('update-ref', '--no-deref', 'HEAD', $git.head)
+    if ($r.Code -ne 0) { throw "git update-ref HEAD: $($r.Err.Trim())" }
   }
-  $script:workerTop = $top
+  # (the index at HEAD, the files untouched: what the home changed shows as changed, as there)
+  $r = Git $here @('reset', '--quiet', '--mixed')
+  if ($r.Code -gt 1) { throw "git reset: $($r.Err.Trim())" }
+}
+
+# The worker's side: each folder brought to the home's state at its path here; returns the job's folder here.
+function Prepare-Checkout([string]$id)
+{
+  $state = (Read-Small (Travel-File $id 'state.json')) | ConvertFrom-Json
+  $owned = Owned-Copies
+  $i = 0
+  $script:workerFolders = @()
+  foreach ($f in @($state.folders))
+  {
+    $here = Worker-Path $f.path
+    if ($here.Length -lt 6) { throw "refused to work at $here" }
+    Beat (Travel-File $id 'alive') "making $here"
+    if ((Test-Path -LiteralPath $here) -and $owned -notcontains (Folder-Key $here) -and -not (Test-Path -LiteralPath (Join-Path $here '.git\heavy-queue-worker')))
+    {
+      Rename-Item -LiteralPath $here -NewName ((Split-Path -Leaf $here) + ".local-$(Get-Date -Format 'yyyyMMdd-HHmmss')")
+    }
+    New-Item -ItemType Directory -Force $here | Out-Null
+    Own-Copy $here
+    if ($f.del) { foreach ($rel in [IO.File]::ReadAllLines((Travel-File $id "f$i.del"))) { if ($rel) { Remove-Item -LiteralPath (Join-Path $here $rel) -Force -ErrorAction SilentlyContinue } } }
+    if ($f.tar)
+    {
+      $r = Run-Beating "$env:windir\System32\tar.exe" @('-xf', (Travel-File $id "f$i.tar"), '-C', $here) (Travel-File $id 'alive') "making $here"
+      if ($r.Code -ne 0) { throw "tar into $($here): $($r.Err.Trim())" }
+    }
+    if ($f.git) { Set-Git $here $f.git (Travel-File $id "f$i.bundle") }
+    $script:workerFolders += $here
+    $i++
+  }
   return (Worker-Path $state.cwd)
 }
 
-# Every file of a checkout but .git's, with its size and time: what a job changed is told by comparing two.
-function Snapshot-Files([string]$top)
+# Every file of each folder (Snapshot-Files: before the job; Pack-Back compares after it).
+function Snapshot-Files($folders) { return ,@(@($folders) | ForEach-Object { [HeavyQueueFiles]::Scan($_, [int]::MaxValue) }) }
+
+# The worker's side, after the job: per folder the files it made or changed (ID.bN.tar) and deleted
+# (ID.bN.del), for the home to take.
+function Pack-Back([string]$id, $folders, $before)
 {
-  $files = @{}
-  $base = $top.TrimEnd('\').Length + 1
-  $git = (Join-Path $top '.git').ToLowerInvariant() + '\'
-  foreach ($f in [IO.Directory]::EnumerateFiles($top, '*', [IO.SearchOption]::AllDirectories))
+  $after = Snapshot-Files $folders
+  $changedAll = 0; $deletedAll = 0
+  for ($i = 0; $i -lt @($folders).Count; $i++)
   {
-    if ($f.ToLowerInvariant().StartsWith($git)) { continue }
-    $i = New-Object IO.FileInfo($f)
-    $files[$f.Substring($base)] = "$($i.Length)|$($i.LastWriteTimeUtc.Ticks)"
+    $bytes = 0L
+    $diff = [HeavyQueueFiles]::Diff($after[$i], $before[$i], [ref]$bytes)
+    if ($diff[0].Count)
+    {
+      $names = Join-Path $env:TEMP "heavy-back-$PID.txt"
+      Write-List $names $diff[0]
+      $r = Run-Beating "$env:windir\System32\tar.exe" @('-cf', (Travel-File $id "b$i.tar"), '-C', @($folders)[$i], '--null', '-T', $names) (Travel-File $id 'alive') 'sending its files back'
+      Remove-Item $names -Force -ErrorAction SilentlyContinue
+      if ($r.Code -ne 0) { throw "tar of the job's files: $($r.Err.Trim())" }
+    }
+    if ($diff[1].Count) { [IO.File]::WriteAllLines((Travel-File $id "b$i.del"), [string[]]$diff[1], (New-Object System.Text.UTF8Encoding($false))) }
+    $changedAll += $diff[0].Count; $deletedAll += $diff[1].Count
   }
-  return $files
+  return "$changedAll files changed, $deletedAll deleted"
 }
 
-# The worker's side, after the job: the files it made or changed in the checkout (build output included)
-# into ID.back.tar, the ones it deleted into ID.back.deleted, for the home to take.
-function Pack-Back([string]$id, [string]$top, $before)
-{
-  $after = Snapshot-Files $top
-  $changed = @($after.Keys | Where-Object { $before[$_] -ne $after[$_] })
-  $deleted = @($before.Keys | Where-Object { -not $after.ContainsKey($_) })
-  if ($changed.Count)
-  {
-    $list = Join-Path $env:TEMP "heavy-back-$PID.txt"
-    [IO.File]::WriteAllText($list, (($changed | ForEach-Object { $_.Replace('\', '/') }) -join "`0"), (New-Object System.Text.UTF8Encoding($false)))
-    $r = Run-Quiet "$env:windir\System32\tar.exe" @('-cf', (Travel-File $id 'back.tar'), '-C', $top, '--null', '-T', $list)
-    Remove-Item $list -Force -ErrorAction SilentlyContinue
-    if ($r.Code -ne 0) { throw "tar of the job's files: $($r.Err.Trim())" }
-  }
-  if ($deleted.Count) { [IO.File]::WriteAllLines((Travel-File $id 'back.deleted'), [string[]]$deleted, (New-Object System.Text.UTF8Encoding($false))) }
-  return "$($changed.Count) files changed, $($deleted.Count) deleted"
-}
-
-# The home's side: the job's files into its checkout, as if it had run here.
-function Unpack-Back([string]$id, [string]$top)
+# The home's side: the job's files into its folders, as if it had run here.
+function Unpack-Back([string]$id, $folders)
 {
   $n = 0
-  if (Test-Path (Travel-File $id 'back.tar'))
+  for ($i = 0; $i -lt @($folders).Count; $i++)
   {
-    $r = Run-Quiet "$env:windir\System32\tar.exe" @('-xf', (Travel-File $id 'back.tar'), '-C', $top)
-    if ($r.Code -ne 0) { throw "tar: $($r.Err.Trim())" }
-    $n = 1
-  }
-  if (Test-Path (Travel-File $id 'back.deleted'))
-  {
-    foreach ($rel in [IO.File]::ReadAllLines((Travel-File $id 'back.deleted'))) { if ($rel) { Remove-Item -LiteralPath (Join-Path $top $rel) -Force -ErrorAction SilentlyContinue } }
-    $n = 1
+    $f = @($folders)[$i]
+    if (Test-Path (Travel-File $id "b$i.tar"))
+    {
+      $r = Run-Quiet "$env:windir\System32\tar.exe" @('-xf', (Travel-File $id "b$i.tar"), '-C', $f)
+      if ($r.Code -ne 0) { throw "tar: $($r.Err.Trim())" }
+      $n++
+    }
+    if (Test-Path (Travel-File $id "b$i.del"))
+    {
+      foreach ($rel in [IO.File]::ReadAllLines((Travel-File $id "b$i.del"))) { if ($rel) { Remove-Item -LiteralPath (Join-Path $f $rel) -Force -ErrorAction SilentlyContinue } }
+      $n++
+    }
   }
   return $n
 }
@@ -567,7 +765,7 @@ public static class HeavyQueueJob
 }
 
 # The home's side once a worker claimed the job: the output as it comes, then the exit code.
-function Follow-Remote([string]$id, [string]$worker, [string]$top)
+function Follow-Remote([string]$id, [string]$worker, $folders)
 {
   [Console]::Error.WriteLine("heavy: $worker runs this job (it travelled from $machine).")
   $stdout = [Console]::OpenStandardOutput(); $stderr = [Console]::OpenStandardError()
@@ -594,7 +792,7 @@ function Follow-Remote([string]$id, [string]$worker, [string]$top)
       $outAt = Pump (Travel-File $id 'out') $outAt $stdout
       $errAt = Pump (Travel-File $id 'err') $errAt $stderr
       $code = if ($exit -match '^(-?\d+)') { [int]$matches[1] } else { 1 }
-      try { if (Unpack-Back $id $top) { [Console]::Error.WriteLine("heavy: the files the job made or changed are here now.") } }
+      try { if (Unpack-Back $id $folders) { [Console]::Error.WriteLine("heavy: the files the job made or changed are here now.") } }
       catch { [Console]::Error.WriteLine("heavy: the job's files could not come back: $($_.Exception.Message)"); if ($code -eq 0) { $code = 1 } }
       [Console]::Error.WriteLine("heavy: $worker finished it: exit $code.")
       return $code

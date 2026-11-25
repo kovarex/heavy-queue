@@ -65,6 +65,7 @@ while ($true)
       if (-not $text) { continue }
       $job = $text | ConvertFrom-Json
       if ($job.machine -eq $machine) { continue }
+      if ($null -eq $job.folders) { continue } # (a home with an older lock: its jobs cannot travel to this one)
       if ($job.kind -eq 'exclusive' -and (Test-Path (Join-Path $root 'no-benchmarks'))) { continue }
       $differs = "Takes no job from $($job.machine): this machine's tools differ ($(@($job.fingerprintCommands) -join '; '))."
       if ($job.tools)
