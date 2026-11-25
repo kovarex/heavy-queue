@@ -91,11 +91,15 @@ function Alive([int]$id) { return $null -ne (Get-Process -Id $id -ErrorAction Si
 # shortestFirst false: first come, first served.
 function Queue-Order
 {
+  # (the live processes, looked up once: a Get-Process per file, in every waiter every 3 s, kept 30 waiters at
+  # 3.7 cores on 2026-11-25)
+  $running = New-Object 'System.Collections.Generic.HashSet[int]'
+  foreach ($p in [System.Diagnostics.Process]::GetProcesses()) { [void]$running.Add($p.Id); $p.Dispose() }
   $list = foreach ($w in @(Get-ChildItem $queueDir -File -ErrorAction SilentlyContinue))
   {
     if ($w.Name -notmatch '^(\d{20})-(\d+)(?:-e(\d+))?(-p)?\.txt$') { continue }
     $id = [int]$matches[2]
-    if ($id -ne $PID -and -not (Alive $id)) { Remove-Item $w.FullName -Force -ErrorAction SilentlyContinue; continue } # (a waiter that died)
+    if ($id -ne $PID -and -not $running.Contains($id)) { Remove-Item $w.FullName -Force -ErrorAction SilentlyContinue; continue } # (a waiter that died)
     $eta = if ($matches[3]) { [double]$matches[3] } else { [double]$unknownEstimate }
     $queued = [double]([long]$matches[1] / 10000000)
     [pscustomobject]@{ File = $w; Pid = $id; Id = "$($matches[1])-$($matches[2])"; Key = $(if ($matches[4]) { -1e12 } else { 0 }) + $(if ($shortestFirst) { $eta + $queued } else { $queued }) }
@@ -609,7 +613,7 @@ if (-not $travelled)
     Clear-Dead-Offers
     $guess = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
     $job = [ordered]@{ id = $ticketName; machine = $machine; pid = $PID; cwd = (Get-Location).Path; line = $line; label = $label; kind = $kind; thread = $thread
-      estimate = $(if ($guess) { $guess.seconds } else { $null }); queued = (Iso $queuedAt); fingerprintCommands = @($fingerprintCommands); tools = (Offer-Tools); fingerprint = (Fingerprint); env = (Travel-Environment); held = $heldVariable; folders = @($plan.Folders) }
+      estimate = $(if ($guess) { $guess.seconds } else { $null }); queued = (Iso $queuedAt); fingerprintCommands = @($fingerprintCommands); tools = (Offer-Tools); fingerprint = (Shared-Fingerprint); env = (Travel-Environment); held = $heldVariable; folders = @($plan.Folders) }
     Beat (Travel-File $ticketName 'waiting') 'waiting'
     Write-Shared (Travel-File $ticketName 'job.json') ($job | ConvertTo-Json -Depth 3 -Compress)
     $offer = $ticketName
@@ -626,9 +630,11 @@ Write-Page
 # (waiters of an older lock order the line by age alone: when nobody has held the slot for 15 s, the oldest
 # waiter takes it whatever the order says, so two that disagree never wait for each other)
 $script:freeSince = $null
+$script:place = 0
 function First-In-Queue
 {
   $order = @(Queue-Order)
+  $script:place = 0; for ($i = 0; $i -lt $order.Count; $i++) { if ($order[$i].Pid -eq $PID) { $script:place = $i } }
   if ($order.Count -eq 0 -or $order[0].Pid -eq $PID) { $script:freeSince = $null; return $true }
   if (Test-Path $holderFile) { $script:freeSince = $null; return $false }
   if (-not $script:freeSince) { $script:freeSince = Get-Date; return $false }
@@ -676,7 +682,7 @@ try
         # (the offer names the tools of now: refreshed every 5 minutes while it waits)
         if (((Get-Date) - $offeredAt).TotalMinutes -ge 5)
         {
-          $job.fingerprint = Fingerprint
+          $job.fingerprint = Shared-Fingerprint
           Write-Shared (Travel-File $offer 'job.json') ($job | ConvertTo-Json -Depth 3 -Compress)
           $offeredAt = Get-Date
         }
@@ -702,7 +708,8 @@ try
       $holder = if (Test-Path $holderFile) { (Get-Content -Raw $holderFile -ErrorAction SilentlyContinue).Trim() } else { '' }
       $now = "heavy: waiting ($why). holder: $holder"
       if ($now -ne $said) { [Console]::Error.WriteLine($now); $said = $now; Write-Page }
-      Start-Sleep -Seconds 3
+      # (the next two in line look every 3 s, the rest every 15 s: a waiter does nothing else)
+      Start-Sleep -Seconds $(if ($script:place -le 1) { 3 } else { 15 })
     }
     if (-not $elsewhere) { break }
     # A worker claimed it: the checkout's state goes over, unless something keeps the job here.

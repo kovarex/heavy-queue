@@ -191,6 +191,23 @@ function Fingerprint($commands = $fingerprintCommands)
   return (@($parts) -join "`n")
 }
 
+# This machine's fingerprint for its offers, worked out by one waiter every 5 minutes and read by the others
+# (ROOT\fingerprint.txt): each of 30 waiters running the commands (kpp, clang, python, WSL) every 5 minutes
+# was most of what waiting cost.
+function Shared-Fingerprint
+{
+  $file = Join-Path $root 'fingerprint.txt'
+  try
+  {
+    $info = Get-Item -LiteralPath $file -ErrorAction Stop
+    if (((Get-Date) - $info.LastWriteTime).TotalMinutes -lt 5) { $text = [IO.File]::ReadAllText($file); if ($text) { return $text } }
+  }
+  catch { }
+  $text = Fingerprint
+  try { Write-Shared $file $text } catch { }
+  return $text
+}
+
 # Tools a worker takes from its home (travelTools, such as a compiler installed from an unreleased build): a
 # folder's identity is a hash of its files' names, sizes and times. The home puts a copy of each folder into
 # EXCHANGE\tools\NAME-ID once; a worker mirrors it into its own copy, ROOT\tools\PATH (stopping what runs from
@@ -220,7 +237,11 @@ function Offer-Tools
   foreach ($folder in @($travelTools))
   {
     if (-not (Test-Path -LiteralPath $folder)) { continue }
-    $id = Tool-Id $folder
+    # (one waiter hashes the folder every 5 minutes, the others read its answer: ROOT	ool-ID-NAME.txt)
+    $cache = Join-Path $root ('tool-id-' + (($folder -replace '[:\\/ ]+', '_').Trim('_')) + '.txt')
+    $id = $null
+    try { $ci = Get-Item -LiteralPath $cache -ErrorAction Stop; if (((Get-Date) - $ci.LastWriteTime).TotalMinutes -lt 5) { $id = [IO.File]::ReadAllText($cache).Trim() } } catch { }
+    if (-not $id) { $id = Tool-Id $folder; try { Write-Shared $cache $id } catch { } }
     $copy = Tool-Copy $folder $id
     if (-not (Test-Path -LiteralPath (Join-Path $copy '.done')))
     {
