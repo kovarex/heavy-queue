@@ -93,12 +93,12 @@ function Queue-Order
 {
   $list = foreach ($w in @(Get-ChildItem $queueDir -File -ErrorAction SilentlyContinue))
   {
-    if ($w.Name -notmatch '^(\d{20})-(\d+)(?:-e(\d+))?\.txt$') { continue }
+    if ($w.Name -notmatch '^(\d{20})-(\d+)(?:-e(\d+))?(-p)?\.txt$') { continue }
     $id = [int]$matches[2]
     if ($id -ne $PID -and -not (Alive $id)) { Remove-Item $w.FullName -Force -ErrorAction SilentlyContinue; continue } # (a waiter that died)
     $eta = if ($matches[3]) { [double]$matches[3] } else { [double]$unknownEstimate }
     $queued = [double]([long]$matches[1] / 10000000)
-    [pscustomobject]@{ File = $w; Pid = $id; Id = "$($matches[1])-$($matches[2])"; Key = $(if ($shortestFirst) { $eta + $queued } else { $queued }) }
+    [pscustomobject]@{ File = $w; Pid = $id; Id = "$($matches[1])-$($matches[2])"; Key = $(if ($matches[4]) { -1e12 } else { 0 }) + $(if ($shortestFirst) { $eta + $queued } else { $queued }) }
   }
   return @($list | Sort-Object Key, Id)
 }
@@ -586,7 +586,11 @@ $queuedTicks = if ($env:HEAVY_QUEUE_SINCE -match '^\d{1,20}$') { [long]$env:HEAV
 Remove-Item Env:\HEAVY_QUEUE_SINCE -ErrorAction SilentlyContinue
 $ticketName = '{0:D20}-{1}' -f $queuedTicks, $PID
 $queueGuess = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
-$ticket = Join-Path $queueDir ("$ticketName-e{0}.txt" -f $(if ($queueGuess) { [int]$queueGuess.seconds } else { [int]$unknownEstimate }))
+# (a first job, from a folder under priorityPaths or with HEAVY_QUEUE_PRIORITY set, goes before every other:
+# among such jobs the order is the same as among the rest)
+$priorityJob = [bool]$env:HEAVY_QUEUE_PRIORITY
+foreach ($f in @($priorityPaths)) { $fk = ([IO.Path]::GetFullPath("$f").TrimEnd('\') + '\').ToLowerInvariant(); if ((((Get-Location).Path.TrimEnd('\') + '\').ToLowerInvariant()).StartsWith($fk)) { $priorityJob = $true } }
+$ticket = Join-Path $queueDir ("$ticketName-e{0}{1}.txt" -f $(if ($queueGuess) { [int]$queueGuess.seconds } else { [int]$unknownEstimate }), $(if ($priorityJob) { '-p' } else { '' }))
 $queuedAt = ([DateTime]::new($queuedTicks, [DateTimeKind]::Utc)).ToLocalTime()
 Write-Shared $ticket ($me -f $queuedAt.ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $label)
 
