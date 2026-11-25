@@ -130,8 +130,10 @@ function Fingerprint($commands = $fingerprintCommands)
     $info.RedirectStandardOutput = $true
     $info.CreateNoWindow = $true
     $p = [System.Diagnostics.Process]::Start($info)
-    $output = $p.StandardOutput.ReadToEnd().Trim()
-    $p.WaitForExit()
+    # (30 s at most: a command that hangs, such as a WSL that does not answer, makes the fingerprint differ)
+    $read = $p.StandardOutput.ReadToEndAsync()
+    if ($read.Wait(30000)) { $output = $read.Result.Trim(); $p.WaitForExit() }
+    else { $output = 'did not answer in 30 s'; try { & taskkill /F /T /PID $p.Id 2>&1 | Out-Null } catch { } }
     "$c => $output"
   }
   return (@($parts) -join "`n")
@@ -139,8 +141,9 @@ function Fingerprint($commands = $fingerprintCommands)
 
 # Tools a worker takes from its home (travelTools, such as a compiler installed from an unreleased build): a
 # folder's identity is a hash of its files' names, sizes and times. The home puts a copy of each folder into
-# EXCHANGE\tools\NAME-ID once; a worker mirrors it over its own folder at the same path (stopping what runs
-# from there first) when the offer's ID differs from its own (PATH\.heavy-queue-tool), then compares tools.
+# EXCHANGE\tools\NAME-ID once; a worker mirrors it into its own copy, ROOT\tools\PATH (stopping what runs from
+# there first), when the offer's ID differs from the copy's (.heavy-queue-tool); a travelled job and its
+# fingerprint run with that copy in place of the folder (Tool-Rewrite, Tool-PathVariable).
 $toolMark = '.heavy-queue-tool'
 function Tool-Id([string]$folder)
 {
@@ -178,30 +181,52 @@ function Offer-Tools
   return ,$tools
 }
 
-# The worker's side, before it compares tools for an offer: its folders brought to the offer's IDs. Returns
-# '' or why not (the note on the board).
+# The worker's side, before it compares tools for an offer: its own copies (ROOT\tools\PATH, never the
+# folder itself, which this machine's own programs use: Visual Studio keeps C:\Program Files\kpp\kpp.exe
+# running, 2026-11-25) brought to the offer's IDs. Returns '' or why not (the note on the board).
+function Tool-Here([string]$path) { return Join-Path $root ('tools\' + (($path -replace '[:\\/]+', '_').Trim('_'))) }
+
+# A travelled job's text (its command line, its environment's values, the fingerprint commands) with each
+# tool folder's path turned into the worker's copy of it.
+function Tool-Rewrite([string]$text, $tools)
+{
+  foreach ($t in @($tools)) { if ($t) { $text = $text -ireplace ([regex]::Escape(([string]$t.path).TrimEnd([char]92)) + '(?=[\\";/ ]|$)'), (Tool-Here $t.path).Replace('$', '$$') } }
+  return $text
+}
+
+# A PATH for a travelled job or its fingerprint: the home's tool folders turned into the worker's copies,
+# and those copies first when PATH did not name the folder.
+function Tool-PathVariable([string]$value, $tools)
+{
+  $value = Tool-Rewrite $value $tools
+  $parts = @($value -split ';')
+  foreach ($t in @($tools)) { if ($t -and -not ($parts -contains (Tool-Here $t.path))) { $value = (Tool-Here $t.path) + ';' + $value } }
+  return $value
+}
+
 function Take-Tools($tools)
 {
   foreach ($t in @($tools))
   {
-    $mark = Join-Path $t.path $toolMark
+    $here = Tool-Here $t.path
+    $mark = Join-Path $here $toolMark
     if ((Read-Small $mark) -eq $t.id) { continue }
     $copy = Tool-Copy $t.path $t.id
     if (-not (Test-Path -LiteralPath (Join-Path $copy '.done'))) { return "the home's copy of $($t.path) is not in the exchange" }
-    # (what runs from that folder holds its files: a compile server from an earlier job)
-    $key = (Folder-Key $t.path)
+    # (what runs from this copy holds its files: a compile server from an earlier job)
+    $key = (Folder-Key $here)
     Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and (Folder-Key (Split-Path $_.ExecutablePath)).StartsWith($key) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 1
+    New-Item -ItemType Directory -Force $here | Out-Null
     # (robocopy's whole output in ROOT\tool-copy.log; its first error line on the board)
-    $log = @(& robocopy $copy $t.path /MIR /R:3 /W:2 /NDL /NJH /NP /XF '.done' $toolMark 2>&1 | ForEach-Object { "$_" })
+    $log = @(& robocopy $copy $here /MIR /R:3 /W:2 /NDL /NJH /NP /XF '.done' $toolMark 2>&1 | ForEach-Object { "$_" })
     $code = $LASTEXITCODE
-    Set-Content -LiteralPath (Join-Path $root 'tool-copy.log') -Value (@("$(Get-Date -Format s) robocopy $copy $($t.path): exit $code") + $log) -Encoding UTF8 -ErrorAction SilentlyContinue
+    Set-Content -LiteralPath (Join-Path $root 'tool-copy.log') -Value (@("$(Get-Date -Format s) robocopy $copy ${here}: exit $code") + $log) -Encoding UTF8 -ErrorAction SilentlyContinue
     if ($code -ge 8)
     {
       $error1 = @($log | Where-Object { $_ -match 'ERROR \d+' } | Select-Object -First 1)
-      $holders = @($log | Where-Object { $_ -match 'ERROR 32 ' }).Count
-      $why = if ($holders) { 'a process outside this worker holds its files' } elseif ($log -match 'ERROR 5 ') { "the worker's user cannot write it: setup-worker.ps1 -Tools `"$($t.path)`", as administrator, gives it that folder" } else { 'see tool-copy.log' }
-      return "could not copy $($t.path) from the exchange (robocopy $code, $why$(if ($error1) { ': ' + $error1[0].Trim() }))"
+      $why = if (@($log | Where-Object { $_ -match 'ERROR 32 ' }).Count) { 'a process holds its files' } else { 'see tool-copy.log' }
+      return "could not copy $($t.path) from the exchange into $here (robocopy $code, $why$(if ($error1) { ': ' + $error1[0].Trim() }))"
     }
     Set-Content -LiteralPath $mark -Value $t.id -Encoding ascii
   }

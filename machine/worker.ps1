@@ -72,9 +72,21 @@ while ($true)
         $toolWhy = Take-Tools $job.tools
         if ($toolWhy) { $why = "Takes no job from $($job.machine): $toolWhy."; continue }
       }
-      if ($job.fingerprint -ne (Mine $job.fingerprintCommands $false)) { $why = $differs; continue }
-      # (the tools now, not a minute ago: one updated since would run the job with other tools)
-      if ($job.fingerprint -ne (Mine $job.fingerprintCommands $true)) { $why = $differs; continue }
+      # (with the home's tools in their copies here, as the job will run: lock\travel.ps1's Take-Tools)
+      # (the home's fingerprint too: its lines name the commands, and a tool may print its own path)
+      $commands = @($job.fingerprintCommands | ForEach-Object { Tool-Rewrite $_ $job.tools })
+      $theirs = Tool-Rewrite $job.fingerprint $job.tools
+      $ownPath = $env:PATH
+      try
+      {
+        # (and with the job's PATH, which it takes along: the python or compiler it will find here)
+        $jobPath = @($job.env.PSObject.Properties | Where-Object { $_.Name -eq 'PATH' } | ForEach-Object { [string]$_.Value })
+        $env:PATH = Tool-PathVariable $(if ($jobPath) { $jobPath[0] } else { $env:PATH }) $job.tools
+        if ($theirs -ne (Mine $commands $false)) { $why = $differs; continue }
+        # (the tools now, not a minute ago: one updated since would run the job with other tools)
+        if ($theirs -ne (Mine $commands $true)) { $why = $differs; continue }
+      }
+      finally { $env:PATH = $ownPath }
       if (-not (Try-Claim (Travel-File $id 'claim') $machine)) { continue }
       $env:HEAVY_QUEUE_COMMAND = "--run-travelled `"$($o.FullName)`""
       try { Start-Process powershell -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$lock`"") | Out-Null }

@@ -487,13 +487,19 @@ function Run-Command
   $info.WorkingDirectory = (Get-Location).Path
   if ($travelled)
   {
-    foreach ($p in $travelled.env.PSObject.Properties) { $info.EnvironmentVariables[$p.Name] = [string]$p.Value }
+    # (the home's tool folders are this worker's copies of them: lock\travel.ps1's Take-Tools)
+    foreach ($p in $travelled.env.PSObject.Properties) { $info.EnvironmentVariables[$p.Name] = Tool-Rewrite ([string]$p.Value) $travelled.tools }
+    $pathName = @($info.EnvironmentVariables.Keys | Where-Object { $_ -eq 'PATH' })[0]
+    if ($travelled.tools -and $pathName) { $info.EnvironmentVariables[$pathName] = Tool-PathVariable ([string]$info.EnvironmentVariables[$pathName]) $travelled.tools }
+    $info.Arguments = '/d /s /c "' + (Tool-Rewrite $line $travelled.tools) + '"'
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
     $info.RedirectStandardInput = $true
   }
   $info.EnvironmentVariables['HEAVY_QUEUE_HELD'] = "$PID"
   if ($heldVariable) { $info.EnvironmentVariables[$heldVariable] = "$PID" }
+  # (and the home's: its scripts' own lock calls, such as a gate that takes the slot itself, run at once here too)
+  if ($travelled -and $travelled.held) { $info.EnvironmentVariables[[string]$travelled.held] = "$PID" }
   $process = [System.Diagnostics.Process]::Start($info)
   if ($travelled) { $process.StandardInput.Close() } # (nobody types into a job that travelled)
   if (-not $travelled)
@@ -571,7 +577,7 @@ if (-not $travelled)
     Clear-Dead-Offers
     $guess = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
     $job = [ordered]@{ id = $ticketName; machine = $machine; pid = $PID; cwd = (Get-Location).Path; line = $line; label = $label; kind = $kind; thread = $thread
-      estimate = $(if ($guess) { $guess.seconds } else { $null }); queued = (Iso $queuedAt); fingerprintCommands = @($fingerprintCommands); tools = (Offer-Tools); fingerprint = (Fingerprint); env = (Travel-Environment) }
+      estimate = $(if ($guess) { $guess.seconds } else { $null }); queued = (Iso $queuedAt); fingerprintCommands = @($fingerprintCommands); tools = (Offer-Tools); fingerprint = (Fingerprint); env = (Travel-Environment); held = $heldVariable }
     Beat (Travel-File $ticketName 'waiting') 'waiting'
     Write-Shared (Travel-File $ticketName 'job.json') ($job | ConvertTo-Json -Depth 3 -Compress)
     $offer = $ticketName
