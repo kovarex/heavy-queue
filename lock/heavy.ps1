@@ -564,7 +564,7 @@ $offer = ''
 if (-not $travelled)
 {
   # (every job may travel but an --exclusive one: a timing run's numbers belong to this machine unless it asks)
-  $stayReason = Travel-Refusal (Get-Location).Path $line $stayHere ((-not $exclusive) -or $mayTravel)
+  $stayReason = Travel-Refusal (Get-Location).Path $line $stayHere ((-not $exclusive) -or $mayTravel -or $travelExclusive)
   if (-not $stayReason)
   {
     New-Item -ItemType Directory -Force $travelExchange | Out-Null
