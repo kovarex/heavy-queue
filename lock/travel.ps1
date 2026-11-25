@@ -192,8 +192,17 @@ function Take-Tools($tools)
     $key = (Folder-Key $t.path)
     Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and (Folder-Key (Split-Path $_.ExecutablePath)).StartsWith($key) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 1
-    & robocopy $copy $t.path /MIR /R:3 /W:2 /NFL /NDL /NJH /NJS /NP /XF '.done' $toolMark | Out-Null
-    if ($LASTEXITCODE -ge 8) { return "could not copy $($t.path) from the exchange (robocopy $LASTEXITCODE; the worker's user cannot write it: setup-worker.ps1 -Tools `"$($t.path)`", as administrator, gives it that folder)" }
+    # (robocopy's whole output in ROOT\tool-copy.log; its first error line on the board)
+    $log = @(& robocopy $copy $t.path /MIR /R:3 /W:2 /NDL /NJH /NP /XF '.done' $toolMark 2>&1 | ForEach-Object { "$_" })
+    $code = $LASTEXITCODE
+    Set-Content -LiteralPath (Join-Path $root 'tool-copy.log') -Value (@("$(Get-Date -Format s) robocopy $copy $($t.path): exit $code") + $log) -Encoding UTF8 -ErrorAction SilentlyContinue
+    if ($code -ge 8)
+    {
+      $error1 = @($log | Where-Object { $_ -match 'ERROR \d+' } | Select-Object -First 1)
+      $holders = @($log | Where-Object { $_ -match 'ERROR 32 ' }).Count
+      $why = if ($holders) { 'a process outside this worker holds its files' } elseif ($log -match 'ERROR 5 ') { "the worker's user cannot write it: setup-worker.ps1 -Tools `"$($t.path)`", as administrator, gives it that folder" } else { 'see tool-copy.log' }
+      return "could not copy $($t.path) from the exchange (robocopy $code, $why$(if ($error1) { ': ' + $error1[0].Trim() }))"
+    }
     Set-Content -LiteralPath $mark -Value $t.id -Encoding ascii
   }
   return ''
