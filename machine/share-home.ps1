@@ -25,21 +25,25 @@ $rules | Enable-NetFirewallRule
 "File and Printer Sharing: $($rules.Count) inbound rules on for Private networks"
 
 $account = $identity.Name
+# (not named $readOnly: PowerShell's names ignore case, and that is the parameter -ReadOnly)
+$readOnlyFolders = @($ReadOnly | ForEach-Object { (Resolve-Path $_).Path.TrimEnd('\') })
 foreach ($folder in $travelRoots)
 {
   $full = (Resolve-Path $folder).Path.TrimEnd('\')
   $shareName = Split-Path -Leaf $full
-  $readOnly = @($ReadOnly | Where-Object { (Resolve-Path $_).Path.TrimEnd('\') -ieq $full }).Count -gt 0
+  $asReadOnly = @($readOnlyFolders | Where-Object { $_ -ieq $full }).Count -gt 0
+  $description = if ($asReadOnly) { 'heavy-queue: read by workers' } else { 'heavy-queue: worked in by workers' }
   $existing = Get-SmbShare -Name $shareName -ErrorAction SilentlyContinue
   if ($existing)
   {
     if ($existing.Path.TrimEnd('\') -ine $full) { throw "a share named $shareName already shares $($existing.Path), not $full" }
-    "\\$env:COMPUTERNAME\$shareName already shares $full"
-    continue
+    if ($existing.Description -eq $description) { "\\$env:COMPUTERNAME\$shareName already shares $full"; continue }
+    if ($existing.Description -notlike 'heavy-queue:*') { throw "\\$env:COMPUTERNAME\$shareName was not made by this script: change it by hand" }
+    Remove-SmbShare -Name $shareName -Force # (made by this script with the other access: made again below)
   }
-  if ($readOnly) { New-SmbShare -Name $shareName -Path $full -ReadAccess $account -Description 'heavy-queue: read by workers' | Out-Null }
-  else { New-SmbShare -Name $shareName -Path $full -FullAccess $account -Description 'heavy-queue: worked in by workers' | Out-Null }
-  "\\$env:COMPUTERNAME\$shareName shares $full ($(if ($readOnly) { 'read-only' } else { 'full access' }), for $account only)"
+  if ($asReadOnly) { New-SmbShare -Name $shareName -Path $full -ReadAccess $account -Description $description | Out-Null }
+  else { New-SmbShare -Name $shareName -Path $full -FullAccess $account -Description $description | Out-Null }
+  "\\$env:COMPUTERNAME\$shareName shares $full ($(if ($asReadOnly) { 'read-only' } else { 'full access' }), for $account only)"
 }
 ''
 "On each worker, as administrator, in its clone of heavy-queue:"
