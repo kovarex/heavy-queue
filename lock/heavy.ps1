@@ -581,10 +581,13 @@ if ($given)
   if ($null -eq $givenSeconds) { [Console]::Error.WriteLine("heavy: --estimate takes a time such as 90s, 10m or 2h, not '$given'."); exit 2 }
 }
 $me = "pid $PID, $kind, since {0}, cwd {1}" + $(if ($thread) { ", thread " + ($thread -replace '\{', '{{' -replace '\}', '}}') }) + $(if ($null -ne $givenSeconds) { ", estimate $($givenSeconds)s" }) + ': {2}'
-$ticketName = '{0:D20}-{1}' -f [DateTime]::UtcNow.Ticks, $PID
+# (HEAVY_QUEUE_SINCE, UTC ticks: a job queued again keeps its place, such as one moved to a newer lock)
+$queuedTicks = if ($env:HEAVY_QUEUE_SINCE -match '^\d{1,20}$') { [long]$env:HEAVY_QUEUE_SINCE } else { [DateTime]::UtcNow.Ticks }
+Remove-Item Env:\HEAVY_QUEUE_SINCE -ErrorAction SilentlyContinue
+$ticketName = '{0:D20}-{1}' -f $queuedTicks, $PID
 $queueGuess = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
 $ticket = Join-Path $queueDir ("$ticketName-e{0}.txt" -f $(if ($queueGuess) { [int]$queueGuess.seconds } else { [int]$unknownEstimate }))
-$queuedAt = Get-Date
+$queuedAt = ([DateTime]::new($queuedTicks, [DateTimeKind]::Utc)).ToLocalTime()
 Write-Shared $ticket ($me -f $queuedAt.ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $label)
 
 # The offer, when this job may travel (lock\travel.ps1); when it asked to travel and may not, the reason.
