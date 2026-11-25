@@ -11,7 +11,7 @@
 # outlives whoever started it, such as a Claude session the desktop app stops after an hour without a turn.
 #
 # While it waits, a job may run on another machine instead, in a copy of its git checkout made there, its
-# there, its output and exit code coming back (lock\travel.ps1). --local keeps it here (the default).
+# output, files and exit code coming back (lock\travel.ps1). --local keeps it here; an --exclusive job goes only with --travel.
 #
 # The slot is a named mutex: Windows frees it when its holder dies, so a killed job never leaves the
 # machine locked. Waiters queue in arrival order (ROOT\queue, one file per waiting process; a dead waiter's
