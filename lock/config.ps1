@@ -28,6 +28,7 @@ $fingerprintCommands = @(Setting 'fingerprint' @() | ForEach-Object { "$_" })
 $travelLimitMB = [int](Setting 'travelLimitMB' 500)
 $travelCheckouts = Setting 'travelCheckouts' ''
 $travelExclusive = [bool](Setting 'travelExclusive' $false) # (timing runs travel too: the machines' hardware is the same)
+$travelByDefault = [bool](Setting 'travelByDefault' $true) # (false: only --travel jobs are offered: what git ignores, such as build outputs, does not travel)
 $travelTools = @(Setting 'travelTools' @() | ForEach-Object { "$_" }) # (folders a worker takes from its home, such as an unreleased compiler's install)
 $computer = Setting 'computer' '' # (the computer this config belongs to: the lock refuses to run elsewhere with it)
 $travelStale = [int](Setting 'travelStale' 90) # (seconds without a heartbeat before the other side counts as gone)

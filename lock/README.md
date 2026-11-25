@@ -126,6 +126,7 @@ default:
 | fingerprint | commands whose output must be the same on two machines for one to run the other's jobs | none |
 | travelLimitMB | the most a travelling job's uncommitted state (changes, new files) may weigh | 500 |
 | travelExclusive | `--exclusive` jobs (timing runs) travel too, without `--travel`: for machines of the same hardware | false |
+| travelByDefault | jobs travel without `--travel`; false offers only `--travel` jobs, for homes whose jobs use build outputs git ignores (those do not travel: the worker's checkout is clean) | true |
 | travelTools | folders a worker takes from its home when its own differ, mirrored at the same path (such as a compiler installed from an unreleased build); setup-worker.ps1 -Tools gives the worker's user those folders | none |
 | travelCheckouts | on a worker, for testing two machines on one computer: where its checkouts go instead of the homes' paths | none |
 | travelStale | seconds without a heartbeat before the other side of a travelled job counts as gone | 90 |

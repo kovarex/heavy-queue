@@ -77,7 +77,7 @@ function Git-Top([string]$folder)
 function Travel-Refusal([string]$cwd, [string]$commandLine, [bool]$forbid, [bool]$allow)
 {
   if ($forbid) { return '--local' }
-  if (-not $allow) { return 'an --exclusive job (a timing run) travels only with --travel' }
+  if (-not $allow) { return 'it travels only with --travel here (travelByDefault, travelExclusive in the config)' }
   if (-not $travelExchange) { return 'no travelExchange in the config' }
   $top = Git-Top $cwd
   if (-not $top) { return 'its folder is in no git checkout' }
