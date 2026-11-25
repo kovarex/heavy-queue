@@ -77,7 +77,7 @@ function Git-Top([string]$folder)
 function Travel-Refusal([string]$cwd, [string]$commandLine, [bool]$forbid, [bool]$allow)
 {
   if ($forbid) { return '--local' }
-  if (-not $allow) { return 'no --travel' }
+  if (-not $allow) { return 'an --exclusive job (a timing run) travels only with --travel' }
   if (-not $travelExchange) { return 'no travelExchange in the config' }
   $top = Git-Top $cwd
   if (-not $top) { return 'its folder is in no git checkout' }
@@ -268,7 +268,7 @@ function Fresh([string]$path)
   return (($now - $last.Since).TotalSeconds -lt $travelStale)
 }
 
-$travelExts = 'job.json', 'stays', 'waiting', 'claim', 'state.json', 'bundle', 'patch', 'new.tar', 'ready', 'refused', 'alive', 'watch', 'out', 'err', 'exit'
+$travelExts = 'job.json', 'stays', 'waiting', 'claim', 'state.json', 'bundle', 'patch', 'new.tar', 'ready', 'refused', 'alive', 'watch', 'out', 'err', 'back.tar', 'back.deleted', 'exit'
 function Remove-Travel([string]$id)
 {
   foreach ($ext in $travelExts) { Remove-Item (Travel-File $id $ext) -Force -ErrorAction SilentlyContinue }
@@ -435,7 +435,60 @@ function Prepare-Checkout([string]$id)
     $r = Run-Quiet "$env:windir\System32\tar.exe" @('-xf', (Travel-File $id 'new.tar'), '-C', $top)
     if ($r.Code -ne 0) { throw "tar: $($r.Err.Trim())" }
   }
+  $script:workerTop = $top
   return (Worker-Path $state.cwd)
+}
+
+# Every file of a checkout but .git's, with its size and time: what a job changed is told by comparing two.
+function Snapshot-Files([string]$top)
+{
+  $files = @{}
+  $base = $top.TrimEnd('\').Length + 1
+  $git = (Join-Path $top '.git').ToLowerInvariant() + '\'
+  foreach ($f in [IO.Directory]::EnumerateFiles($top, '*', [IO.SearchOption]::AllDirectories))
+  {
+    if ($f.ToLowerInvariant().StartsWith($git)) { continue }
+    $i = New-Object IO.FileInfo($f)
+    $files[$f.Substring($base)] = "$($i.Length)|$($i.LastWriteTimeUtc.Ticks)"
+  }
+  return $files
+}
+
+# The worker's side, after the job: the files it made or changed in the checkout (build output included)
+# into ID.back.tar, the ones it deleted into ID.back.deleted, for the home to take.
+function Pack-Back([string]$id, [string]$top, $before)
+{
+  $after = Snapshot-Files $top
+  $changed = @($after.Keys | Where-Object { $before[$_] -ne $after[$_] })
+  $deleted = @($before.Keys | Where-Object { -not $after.ContainsKey($_) })
+  if ($changed.Count)
+  {
+    $list = Join-Path $env:TEMP "heavy-back-$PID.txt"
+    [IO.File]::WriteAllText($list, (($changed | ForEach-Object { $_.Replace('\', '/') }) -join "`0"), (New-Object System.Text.UTF8Encoding($false)))
+    $r = Run-Quiet "$env:windir\System32\tar.exe" @('-cf', (Travel-File $id 'back.tar'), '-C', $top, '--null', '-T', $list)
+    Remove-Item $list -Force -ErrorAction SilentlyContinue
+    if ($r.Code -ne 0) { throw "tar of the job's files: $($r.Err.Trim())" }
+  }
+  if ($deleted.Count) { [IO.File]::WriteAllLines((Travel-File $id 'back.deleted'), [string[]]$deleted, (New-Object System.Text.UTF8Encoding($false))) }
+  return "$($changed.Count) files changed, $($deleted.Count) deleted"
+}
+
+# The home's side: the job's files into its checkout, as if it had run here.
+function Unpack-Back([string]$id, [string]$top)
+{
+  $n = 0
+  if (Test-Path (Travel-File $id 'back.tar'))
+  {
+    $r = Run-Quiet "$env:windir\System32\tar.exe" @('-xf', (Travel-File $id 'back.tar'), '-C', $top)
+    if ($r.Code -ne 0) { throw "tar: $($r.Err.Trim())" }
+    $n = 1
+  }
+  if (Test-Path (Travel-File $id 'back.deleted'))
+  {
+    foreach ($rel in [IO.File]::ReadAllLines((Travel-File $id 'back.deleted'))) { if ($rel) { Remove-Item -LiteralPath (Join-Path $top $rel) -Force -ErrorAction SilentlyContinue } }
+    $n = 1
+  }
+  return $n
 }
 
 # On a worker, the lock that runs a travelled job and everything it starts are in one job object that kills
@@ -480,7 +533,7 @@ public static class HeavyQueueJob
 }
 
 # The home's side once a worker claimed the job: the output as it comes, then the exit code.
-function Follow-Remote([string]$id, [string]$worker)
+function Follow-Remote([string]$id, [string]$worker, [string]$top)
 {
   [Console]::Error.WriteLine("heavy: $worker runs this job (it travelled from $machine).")
   $stdout = [Console]::OpenStandardOutput(); $stderr = [Console]::OpenStandardError()
@@ -507,6 +560,8 @@ function Follow-Remote([string]$id, [string]$worker)
       $outAt = Pump (Travel-File $id 'out') $outAt $stdout
       $errAt = Pump (Travel-File $id 'err') $errAt $stderr
       $code = if ($exit -match '^(-?\d+)') { [int]$matches[1] } else { 1 }
+      try { if (Unpack-Back $id $top) { [Console]::Error.WriteLine("heavy: the files the job made or changed are here now.") } }
+      catch { [Console]::Error.WriteLine("heavy: the job's files could not come back: $($_.Exception.Message)"); if ($code -eq 0) { $code = 1 } }
       [Console]::Error.WriteLine("heavy: $worker finished it: exit $code.")
       return $code
     }

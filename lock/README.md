@@ -45,20 +45,21 @@ a Claude Code session an hour after its last turn and ends every process the ses
 
 ## Jobs that travel
 
-A job started with `--travel` from a git checkout may run on another machine, a worker, while it waits
-here. Once a worker claims it, this machine puts the checkout's exact state into the exchange folder both
-see (`travelExchange`, a NAS share): its commit, the commits no remote has (a git bundle), the uncommitted
-changes and the new files git does not ignore. The worker makes the same checkout at the same path (from a
-mirror of the remote it keeps, so a second time fetches only what is new), clears everything git ignores
-there (a stale build would be tested otherwise), and runs the command in the same folder of it. For whoever
-started it, the job ran as before: its output comes back to heavy.cmd as it is written, then its exit
-code, with a line saying where it ran. No file comes back.
+A waiting job from a git checkout may run on another machine, a worker, while it waits here (every job but
+an `--exclusive` one, unless `--local`). Once a worker claims it, this machine puts the checkout's exact
+state into the exchange folder both see (`travelExchange`, a NAS share): its commit, the commits no remote
+has (a git bundle), the uncommitted changes and the new files git does not ignore. The worker makes the same
+checkout at the same path (from a mirror of the remote it keeps, so a second time fetches only what is new),
+clears everything git ignores there, and runs the command in the same folder of it. Its output comes back to
+heavy.cmd as it is written; when it ends, every file it made, changed or deleted in the checkout (build
+output included) comes back the same way into this machine's checkout, then its exit code, with a line
+saying where it ran. For whoever started it, the job ran here.
 
-- **Which jobs:** `--travel` from a folder in a git checkout whose command line names nothing outside the
-  checkout (or `samePaths`, the same on every machine): a job whose result is its output and exit code (a
-  gate, a test run) and that builds what it uses itself (`--travel cmd /c "build.cmd && gate.cmd"`). A
-  build whose files the thread uses afterwards stays here (no `--travel`). The pages say why a job asked to
-  travel stays ("stays here: ...") or that it may travel.
+- **Which jobs:** any job from a folder in a git checkout whose command line names nothing outside the
+  checkout (or `samePaths`, the same on every machine). An `--exclusive` job (a timing run) travels only
+  with `--travel`: its numbers belong to this machine's hardware. `--local` keeps any job here. A job
+  outside a git checkout stays here (it cannot be copied). The pages say why a job stays ("stays here: ...")
+  or that it may travel.
 - **Which worker:** an open worker whose slot is free and that has nothing queued claims the oldest job it
   may run: the same tools (the offer names its `fingerprint` commands and their output here; the worker runs
   the same commands, again right before it claims), and no `--exclusive` job on a no-benchmarks machine.

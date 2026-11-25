@@ -10,7 +10,7 @@
 # process tree, its output in a log file and its exit code in LOG.exit (lock\detached.ps1): a job that
 # outlives whoever started it, such as a Claude session the desktop app stops after an hour without a turn.
 #
-# --travel: while it waits, the job may run on another machine instead, in a copy of its git checkout made
+# While it waits, a job may run on another machine instead, in a copy of its git checkout made there, its
 # there, its output and exit code coming back (lock\travel.ps1). --local keeps it here (the default).
 #
 # The slot is a named mutex: Windows frees it when its holder dies, so a killed job never leaves the
@@ -563,7 +563,8 @@ Write-Shared $ticket ($me -f $queuedAt.ToString('MM-dd HH:mm:ss'), (Get-Location
 $offer = ''
 if (-not $travelled)
 {
-  $stayReason = Travel-Refusal (Get-Location).Path $line $stayHere $mayTravel
+  # (every job may travel but an --exclusive one: a timing run's numbers belong to this machine unless it asks)
+  $stayReason = Travel-Refusal (Get-Location).Path $line $stayHere ((-not $exclusive) -or $mayTravel)
   if (-not $stayReason)
   {
     New-Item -ItemType Directory -Force $travelExchange | Out-Null
@@ -576,7 +577,7 @@ if (-not $travelled)
     $offer = $ticketName
     $offeredAt = Get-Date
   }
-  elseif ($mayTravel)
+  elseif ($travelExchange)
   {
     New-Item -ItemType Directory -Force $travelDir | Out-Null
     Write-Shared (Travel-File $ticketName 'stays') $stayReason
@@ -677,7 +678,7 @@ try
     $startedAt = Get-Date
     $atStart = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
     Write-Page
-    $result = Follow-Remote $offer $elsewhere
+    $result = Follow-Remote $offer $elsewhere (Git-Top (Get-Location).Path)
     if ($null -ne $result) { $code = $result; $ranElsewhere = $true; break }
     # Not run there (the worker could not make the checkout): here after all, in its place in the line.
     [Console]::Error.WriteLine("heavy: $elsewhere did not run it: it runs here.")
@@ -712,6 +713,7 @@ try
         {
           Beat (Travel-File $travelled.id 'alive') 'making its checkout'
           $here = Prepare-Checkout $travelled.id
+          $before = Snapshot-Files $script:workerTop
           Set-Location -LiteralPath $here
         }
         catch
@@ -752,6 +754,11 @@ try
         if (-not $killWithMe) { [Console]::Error.WriteLine('heavy: no job object: a lock killed mid-job would leave the job running.') }
       }
       $code = Run-Command
+      if ($travelled -and $before)
+      {
+        try { Beat (Travel-File $travelled.id 'alive') 'sending its files back'; $backNote = Pack-Back $travelled.id $script:workerTop $before; [Console]::Error.WriteLine("heavy: $backNote") }
+        catch { try { Add-Content -Path (Travel-File $travelled.id 'err') -Value "heavy: the job's files could not go back: $($_.Exception.Message)" } catch { }; if ($code -eq 0) { $code = 1 } }
+      }
       # Stopped from outside (ROOT\stopped-PID.txt says why, e.g. its machine was closed): said here, so the
       # thread knows to run the job again, there or elsewhere.
       $stopped = Join-Path $root "stopped-$PID.txt"
