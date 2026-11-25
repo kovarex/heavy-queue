@@ -1,7 +1,9 @@
 # Sets this computer up as a worker: it runs other machines' waiting jobs that may travel (lock\travel.ps1),
 # which come and go through a folder every machine sees (-Exchange, a NAS share). Run once, in PowerShell, in
 # this computer's clone of heavy-queue:
-#   powershell -ExecutionPolicy Bypass -File machine\setup-worker.ps1 -Exchange \\NAS\SHARE\FOLDER -PublishFile PATH [-Name NAME] [-NoBenchmarks]
+#   powershell -ExecutionPolicy Bypass -File machine\setup-worker.ps1 -Exchange \\NAS\SHARE\FOLDER -PublishFile PATH [-Name NAME] [-NoBenchmarks] [-Tools DIR,DIR]
+# -Tools: the folders the homes' travelTools name (such as C:\Program Files\kpp): made if missing and given to
+#   this user to modify, so the worker mirrors the homes' tools over them without running as administrator.
 # -PublishFile, -Name, -NoBenchmarks: as machine\setup-machine.ps1, which this runs too (this machine's own
 # lock, its gate and its card on the board).
 # It writes "travelExchange" into config.json and registers the scheduled task "heavy-queue worker"
@@ -13,7 +15,8 @@ param(
   [Parameter(Mandatory = $true)][string]$Exchange,
   [Parameter(Mandatory = $true)][string]$PublishFile,
   [string]$Name = '',
-  [switch]$NoBenchmarks)
+  [switch]$NoBenchmarks,
+  [string[]]$Tools = @())
 $ErrorActionPreference = 'Stop'
 $clone = Split-Path $PSScriptRoot
 if (-not (Test-Path -LiteralPath $Exchange)) { New-Item -ItemType Directory -Force $Exchange | Out-Null }
@@ -30,6 +33,13 @@ $setup = @{ PublishFile = $PublishFile }
 if ($Name) { $setup.Name = $Name }
 if ($NoBenchmarks) { $setup.NoBenchmarks = $true }
 & (Join-Path $PSScriptRoot 'setup-machine.ps1') @setup
+foreach ($folder in $Tools)
+{
+  New-Item -ItemType Directory -Force $folder | Out-Null
+  & icacls $folder /grant "$($env:USERDOMAIN)\$($env:USERNAME):(OI)(CI)M" /T /C /Q | Out-Null
+  if ($LASTEXITCODE) { throw "could not give $folder to $env:USERNAME (icacls $LASTEXITCODE): run this as administrator" }
+  "tool folder ${folder}: $env:USERNAME may modify it"
+}
 Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*machine\worker.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$clone\machine\worker.ps1`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME

@@ -193,7 +193,7 @@ function Take-Tools($tools)
     Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and (Folder-Key (Split-Path $_.ExecutablePath)).StartsWith($key) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 1
     & robocopy $copy $t.path /MIR /R:3 /W:2 /NFL /NDL /NJH /NJS /NP /XF '.done' $toolMark | Out-Null
-    if ($LASTEXITCODE -ge 8) { return "could not copy $($t.path) from the exchange (robocopy $LASTEXITCODE; this worker needs to run as administrator for Program Files)" }
+    if ($LASTEXITCODE -ge 8) { return "could not copy $($t.path) from the exchange (robocopy $LASTEXITCODE; the worker's user cannot write it: setup-worker.ps1 -Tools `"$($t.path)`", as administrator, gives it that folder)" }
     Set-Content -LiteralPath $mark -Value $t.id -Encoding ascii
   }
   return ''
