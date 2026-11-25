@@ -25,6 +25,7 @@ $idleSeconds = [int](Setting 'idleSeconds' 20)
 $travelExchange = Setting 'travelExchange' ''
 $shortestFirst = [bool](Setting 'shortestFirst' $true) # (the line's order: heavy.ps1's Queue-Order)
 $unknownEstimate = [int](Setting 'unknownEstimate' 3600) # (seconds, for a job nothing is known about)
+$liveWaiters = [int](Setting 'liveWaiters' 3) # (the first in line with a process of their own: the rest of the detached jobs wait as files)
 $priorityPaths = @(Setting 'priorityPaths' @() | ForEach-Object { "$_" }) # (jobs from these folders go first: what others wait on)
 $priorityPattern = Setting 'priorityPattern' '' # (a regular expression: jobs whose name or command line match it go first, --exclusive ones never)
 $samePaths = @(Setting 'samePaths' @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:windir) | ForEach-Object { "$_" })

@@ -97,12 +97,15 @@ function Queue-Order
   foreach ($p in [System.Diagnostics.Process]::GetProcesses()) { [void]$running.Add($p.Id); $p.Dispose() }
   $list = foreach ($w in @(Get-ChildItem $queueDir -File -ErrorAction SilentlyContinue))
   {
-    if ($w.Name -notmatch '^(\d{20})-(\d+)(?:-e(\d+))?(-p)?\.txt$') { continue }
-    $id = [int]$matches[2]
-    if ($id -ne $PID -and -not $running.Contains($id)) { Remove-Item $w.FullName -Force -ErrorAction SilentlyContinue; continue } # (a waiter that died)
+    if ($w.Name -notmatch '^(\d{20})-(\d+|d[0-9x]+)(?:-e(\d+))?(-p)?\.txt$') { continue }
+    $data = $matches[2].StartsWith('d')
+    $id = if ($data) { 0 } else { [int]$matches[2] }
+    # (a waiter that died, or a waiting detached job whose job file is gone: started, or given up)
+    if ($data) { if (-not (Test-Path -LiteralPath (Join-Path $root "detached\$($matches[2]).json"))) { Remove-Item $w.FullName -Force -ErrorAction SilentlyContinue; continue } }
+    elseif ($id -ne $PID -and -not $running.Contains($id)) { Remove-Item $w.FullName -Force -ErrorAction SilentlyContinue; continue }
     $eta = if ($matches[3]) { [double]$matches[3] } else { [double]$unknownEstimate }
     $queued = [double]([long]$matches[1] / 10000000)
-    [pscustomobject]@{ File = $w; Pid = $id; Id = "$($matches[1])-$($matches[2])"; Key = $(if ($matches[4]) { -1e12 } else { 0 }) + $(if ($shortestFirst) { $eta + $queued } else { $queued }) }
+    [pscustomobject]@{ File = $w; Pid = $id; Data = $data; Ticks = $matches[1]; JobId = $(if ($data) { $matches[2] } else { '' }); Id = "$($matches[1])-$($matches[2])"; Key = $(if ($matches[4]) { -1e12 } else { 0 }) + $(if ($shortestFirst) { $eta + $queued } else { $queued }) }
   }
   return @($list | Sort-Object Key, Id)
 }
@@ -432,6 +435,70 @@ tick(); setInterval(tick, 1000);
 }
 
 if ($status) { Show-Status; Write-Page; exit 0 }
+
+# A waiting detached job is data, no process: its job file (ROOT\detached\ID.json: folder, command line,
+# log, environment) and its place in the line (queue\TICKS-ID-eSECONDS[-p].txt, ID = dDATExPID). One
+# dispatcher per machine (this script with --dispatch, started when such a job is queued or found waiting)
+# gives the first liveWaiters (3) in the line a process of their own, which takes the slot or travels as any
+# job; the rest wait as files. It ends when no such job is left.
+function Ensure-Dispatcher
+{
+  $probe = New-Object System.Threading.Mutex($false, "$mutexName-dispatcher")
+  $free = $false
+  try { $free = $probe.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $free = $true }
+  if ($free) { $probe.ReleaseMutex() }
+  $probe.Dispose()
+  if (-not $free) { return }
+  $setConfig = if ($env:HEAVY_QUEUE_CONFIG) { "`$env:HEAVY_QUEUE_CONFIG='$($env:HEAVY_QUEUE_CONFIG)'; " } else { '' }
+  $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"${setConfig}`$env:HEAVY_QUEUE_COMMAND='--dispatch'; & '$PSScriptRoot\heavy.ps1'`""
+  $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+  [void](Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $command; CurrentDirectory = $root; ProcessStartupInformation = $startup })
+}
+
+function Start-Detached([string]$jobFile, [string]$folder)
+{
+  $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+  $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSScriptRoot\detached.ps1`" `"$jobFile`""
+  return (Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $command; CurrentDirectory = $folder; ProcessStartupInformation = $startup })
+}
+
+if ($line -eq '--dispatch')
+{
+  $single = New-Object System.Threading.Mutex($false, "$mutexName-dispatcher")
+  $mine = $false
+  try { $mine = $single.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $mine = $true }
+  if (-not $mine) { exit 0 }
+  $wake = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, "$mutexName-changed")
+  $started = @{}
+  while ($true)
+  {
+    $order = @(Queue-Order)
+    if (-not @($order | Where-Object { $_.Data }).Count) { break }
+    for ($i = 0; $i -lt [Math]::Min($order.Count, $liveWaiters); $i++)
+    {
+      $q = $order[$i]
+      if (-not $q.Data) { continue }
+      if ($started[$q.Id] -and ((Get-Date) - $started[$q.Id]).TotalSeconds -lt 60) { continue }
+      $jobFile = Join-Path $root "detached\$($q.JobId).json"
+      try
+      {
+        $job = Get-Content -Raw -LiteralPath $jobFile | ConvertFrom-Json
+        # (it keeps its place: queued at the same time; its process removes this file once its own is there)
+        $job.env | Add-Member -NotePropertyName HEAVY_QUEUE_SINCE -NotePropertyValue $q.Ticks.TrimStart('0') -Force
+        $job.env | Add-Member -NotePropertyName HEAVY_QUEUE_ENTRY -NotePropertyValue $q.File.FullName -Force
+        Write-Shared $jobFile ($job | ConvertTo-Json -Depth 3 -Compress)
+        $made = Start-Detached $jobFile $job.cwd
+        if ($made.ReturnValue -eq 0) { $started[$q.Id] = Get-Date }
+      }
+      catch { }
+    }
+    [void]$wake.WaitOne(20000)
+  }
+  $single.ReleaseMutex()
+  # (a job queued as this one decided to end: started by the next look, as the line still has it)
+  if (@(Queue-Order | Where-Object { $_.Data }).Count) { Ensure-Dispatcher }
+  exit 0
+}
 # --help, -h, /? or any option this lock does not know: the usage, never a job (three threads queued "--help"
 # as a command line, 2026-11-25).
 if ($line -match '^(--\S*|-h|-\?|/\?|/h|/help)(\s|$)') { [Console]::Error.WriteLine("heavy: $(if ($matches[1] -match '^(--help|-h|-\?|/\?|/h|/help)$') { 'usage' } else { "unknown option $($matches[1])" })"); $line = '' }
@@ -471,19 +538,28 @@ if ($detach)
   New-Item -ItemType Directory -Force (Split-Path $log) | Out-Null
   Remove-Item -LiteralPath "$log.exit" -Force -ErrorAction SilentlyContinue
   [IO.File]::WriteAllText($log, '', (New-Object System.Text.UTF8Encoding($false)))
-  $jobFile = Join-Path $detachDir "$id.json"
+  # (waiting, it is data: this job file and its place in the line; the dispatcher starts its process)
+  $dataId = 'd{0}x{1}' -f (Get-Date -Format 'yyyyMMddHHmmss'), $PID
+  $jobFile = Join-Path $detachDir "$dataId.json"
   $job = [ordered]@{ cwd = (Get-Location).Path; line = $whole; log = $log; env = $environment }
   Write-Shared $jobFile ($job | ConvertTo-Json -Depth 3 -Compress)
-  $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
-  $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSScriptRoot\detached.ps1`" `"$jobFile`""
-  $made = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $command; CurrentDirectory = (Get-Location).Path; ProcessStartupInformation = $startup }
-  if ($made.ReturnValue -ne 0)
-  {
-    Remove-Item -LiteralPath $jobFile -Force -ErrorAction SilentlyContinue
-    [Console]::Error.WriteLine("heavy: could not start the detached job (Win32_Process.Create returned $($made.ReturnValue)).")
-    exit 1
-  }
-  "heavy: detached (pid $($made.ProcessId)): $whole"
+  $dLabel = if ($name) { $name } else { $line }
+  if ($dLabel.Length -gt 160) { $dLabel = $dLabel.Substring(0, 160) + '...' }
+  $dKind = if ($exclusive) { 'exclusive' } else { 'heavy' }
+  $dThread = Thread-Title
+  $dGiven = if ($given) { Parse-Seconds $given } else { $null }
+  $dGuess = Estimate ([pscustomobject]@{ Given = $dGiven; Label = $dLabel; Thread = $dThread; Cwd = (Get-Location).Path; Kind = $dKind })
+  $dFirst = ($priorityPattern -and -not $exclusive -and "$dLabel $line" -match $priorityPattern)
+  foreach ($f in @($priorityPaths)) { if (Under-Any (Get-Location).Path @($f)) { $dFirst = $true } }
+  $dTicks = [DateTime]::UtcNow.Ticks
+  New-Item -ItemType Directory -Force $queueDir | Out-Null
+  $entry = Join-Path $queueDir ('{0:D20}-{1}-e{2}{3}.txt' -f $dTicks, $dataId, $(if ($dGuess) { [int]$dGuess.seconds } else { [int]$unknownEstimate }), $(if ($dFirst) { '-p' } else { '' }))
+  $dMe = "pid 0, $dKind, since {0}, cwd {1}" + $(if ($dThread) { ", thread " + ($dThread -replace '\{', '{{' -replace '\}', '}}') }) + $(if ($null -ne $dGiven) { ", estimate $($dGiven)s" }) + ': {2}'
+  Write-Shared $entry ($dMe -f (Get-Date).ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $dLabel)
+  Ensure-Dispatcher
+  $wake = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, "$mutexName-changed")
+  [void]$wake.Set(); Start-Sleep -Milliseconds 300; [void]$wake.Reset()
+  "heavy: detached (waiting in the line as $dataId): $whole"
   "heavy: output in $log; when the job ends, $log.exit holds its exit code."
   exit 0
 }
@@ -599,6 +675,8 @@ foreach ($f in @($priorityPaths)) { $fk = ([IO.Path]::GetFullPath("$f").TrimEnd(
 $ticket = Join-Path $queueDir ("$ticketName-e{0}{1}.txt" -f $(if ($queueGuess) { [int]$queueGuess.seconds } else { [int]$unknownEstimate }), $(if ($priorityJob) { '-p' } else { '' }))
 $queuedAt = ([DateTime]::new($queuedTicks, [DateTimeKind]::Utc)).ToLocalTime()
 Write-Shared $ticket ($me -f $queuedAt.ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $label)
+# (a detached job the dispatcher started: its own file now stands in the line, the waiting one goes)
+if ($env:HEAVY_QUEUE_ENTRY) { Remove-Item -LiteralPath $env:HEAVY_QUEUE_ENTRY -Force -ErrorAction SilentlyContinue; Remove-Item Env:\HEAVY_QUEUE_ENTRY -ErrorAction SilentlyContinue }
 
 # The offer, when this job may travel (lock\travel.ps1); when it asked to travel and may not, the reason.
 $offer = ''
@@ -639,7 +717,9 @@ function First-In-Queue
   if (Test-Path $holderFile) { $script:freeSince = $null; return $false }
   if (-not $script:freeSince) { $script:freeSince = Get-Date; return $false }
   if (((Get-Date) - $script:freeSince).TotalSeconds -lt 15) { return $false }
-  return ((@($order | Sort-Object Id)[0]).Pid -eq $PID)
+  # (a waiting detached job first: the dispatcher starts it; one that is not there is started again)
+  if ($order[0].Data) { Ensure-Dispatcher; return $false }
+  return ((@($order | Where-Object { -not $_.Data } | Sort-Object Id)[0]).Pid -eq $PID)
 }
 
 # Why this waiter may not start yet besides the slot, or $null. A quiet flag whose holder died is removed.

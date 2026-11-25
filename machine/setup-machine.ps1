@@ -49,6 +49,9 @@ $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $taskSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName 'heavy-queue machine gate' -Action $action -Trigger $trigger -Settings $taskSettings -Force | Out-Null
 Start-ScheduledTask -TaskName 'heavy-queue machine gate'
+# (waiting detached jobs are files: after a restart this starts the dispatcher that gives them their processes)
+$dispatch = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"`$env:HEAVY_QUEUE_COMMAND='--dispatch'; & '$clone\lock\heavy.ps1'`""
+Register-ScheduledTask -TaskName 'heavy-queue dispatcher' -Action $dispatch -Trigger $trigger -Settings $taskSettings -Force | Out-Null
 Start-Sleep 5
 "data folder: $root, hold file: $schedule"
 'hold file line 1: ' + (Get-Content $schedule -TotalCount 1)
