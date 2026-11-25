@@ -656,6 +656,12 @@ function Machine-Held
 }
 
 $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+# Waiting costs nothing: the first in line blocks on the slot itself, the others on this event, which whoever
+# changes the line (a job queued, started, finished) sets for a moment. Each wakes at least every 20 s anyway
+# (a waiter that died says nothing; a travelling offer beats; a hold may have ended).
+$changed = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, "$mutexName-changed")
+function Signal-Change { try { [void]$changed.Set(); Start-Sleep -Milliseconds 300; [void]$changed.Reset() } catch { } }
+Signal-Change # (a job joined the line: it may go before the waiters there)
 # Whoever started this waiter (heavy.cmd's cmd.exe): gone while the job waits (a caller stopped from outside),
 # the job is no longer wanted and leaves the line.
 $parentPid = 0
@@ -695,21 +701,21 @@ try
       if (-not $why) { $why = Machine-Held }
       if (-not $why)
       {
-        try { $held = $mutex.WaitOne(2000) } catch [System.Threading.AbandonedMutexException] { $held = $true }
+        try { $held = $mutex.WaitOne(20000) } catch [System.Threading.AbandonedMutexException] { $held = $true }
         if (-not $held) { $why = 'the heavy slot is taken' }
       }
       # This machine claims its own job before running it: a worker that claimed it first runs it instead.
       if ($held -and $offer -and -not (Try-Claim (Travel-File $offer 'claim') $machine))
       {
         $who = Read-Small (Travel-File $offer 'claim')
-        if ($who -ne $machine) { $mutex.ReleaseMutex(); $held = $false; $elsewhere = $who; break }
+        if ($who -ne $machine) { $mutex.ReleaseMutex(); Signal-Change; $held = $false; $elsewhere = $who; break }
       }
       if ($held) { break }
       $holder = if (Test-Path $holderFile) { (Get-Content -Raw $holderFile -ErrorAction SilentlyContinue).Trim() } else { '' }
       $now = "heavy: waiting ($why). holder: $holder"
-      if ($now -ne $said) { [Console]::Error.WriteLine($now); $said = $now; Write-Page }
-      # (the next two in line look every 3 s, the rest every 15 s: a waiter does nothing else)
-      Start-Sleep -Seconds $(if ($script:place -le 1) { 3 } else { 15 })
+      if ($now -ne $said) { [Console]::Error.WriteLine($now); $said = $now }
+      # (the first in line waited on the slot above; the others sleep until the line changes)
+      if ($why -ne 'the heavy slot is taken') { [void]$changed.WaitOne(20000) }
     }
     if (-not $elsewhere) { break }
     # A worker claimed it: the checkout's state goes over, unless something keeps the job here.
@@ -721,6 +727,7 @@ try
       continue
     }
     Remove-Item $ticket -Force -ErrorAction SilentlyContinue
+    Signal-Change
     $startedAt = Get-Date
     $atStart = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
     Write-Page
@@ -734,6 +741,7 @@ try
   if (-not $ranElsewhere)
   {
     Remove-Item $ticket -Force -ErrorAction SilentlyContinue
+    Signal-Change
     $startedAt = Get-Date
     $atStart = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
     Write-Shared $holderFile ($me -f $startedAt.ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $label)
@@ -842,6 +850,7 @@ finally
       if ($exclusive -and $runIt) { Remove-Item $flag -Force -ErrorAction SilentlyContinue }
       Remove-Item $holderFile -Force -ErrorAction SilentlyContinue
       $mutex.ReleaseMutex()
+      Signal-Change
     }
     $clean = ($label -replace "[`t`r`n]", ' ')
     $record = @($queuedAt.ToString('s'), $startedAt.ToString('s'), (Get-Date).ToString('s'), "$code", $kind, (Get-Location).Path, $clean, $thread, $(if ($atStart) { "$($atStart.seconds) $($atStart.basis)" } else { '' }), $(if ($ranElsewhere) { $elsewhere } else { '' })) -join "`t"
