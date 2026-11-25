@@ -13,8 +13,7 @@ machine, and a public board that shows every machine's queue.
   Open / Close / Close now buttons for the machines whose gate asks it. board\README.md.
 - `machine/`: what runs on each machine besides the lock: publish.ps1 (posts the status to the board),
   machine-gate.ps1 (opens and closes the machine from the board), worker.ps1 (runs another machine's
-  jobs), and the setups: setup-machine.ps1, share-home.ps1 (a machine whose jobs travel) and
-  setup-worker.ps1 (a machine that runs them).
+  jobs), and the setups: setup-machine.ps1 and setup-worker.ps1 (a machine that runs others' jobs).
 - `deploy/`: uploading a new board program, or a page, to its host.
 
 Windows machines (PowerShell 5.1); the board runs as a CGI program on a FreeBSD web host.
@@ -24,9 +23,9 @@ Windows machines (PowerShell 5.1); the board runs as a CGI program on a FreeBSD 
 - **A machine:** clone this repository on it, copy config.example.json to config.json and set what
   differs from the defaults (lock\README.md lists them), then run
   `machine\setup-machine.ps1 -PublishFile PATH` with a publish.txt (machine\publish.example.txt).
-- **Jobs that travel:** on the machine whose jobs travel, set `travelRoots` (and `fingerprint`) in
-  config.json and run machine\share-home.ps1 as administrator; on each worker, run
-  machine\setup-worker.ps1 as administrator (it runs setup-machine.ps1 too).
+- **Jobs that travel:** on every machine, set `travelExchange` (a folder all of them see, such as a NAS
+  share) and, on a machine whose jobs travel, `fingerprint` in config.json; on each worker, run
+  machine\setup-worker.ps1 (it runs setup-machine.ps1 too).
 - **The board:** board\README.md, Install.
 
 ## Secrets

@@ -18,12 +18,14 @@ $heldVariable = Setting 'heldVariable' ''
 $title = Setting 'title' "$machine heavy slot"
 $idleLoad = [int](Setting 'idleLoad' 15)
 $idleSeconds = [int](Setting 'idleSeconds' 20)
-# Jobs that travel (lock\travel.ps1): this machine's folders that other machines see at the same paths, the
+# Jobs that travel (lock\travel.ps1): the folder every machine sees (a NAS share) through which they go, the
 # paths that are the same on every machine anyway, the commands whose output must match for two machines to
-# run each other's jobs, and, on a worker, the home machine's data folder as this machine sees it.
-$travelRoots = @(Setting 'travelRoots' @() | ForEach-Object { "$_" })
+# run each other's jobs, how much a job's uncommitted state may weigh, and, for testing two machines on one
+# computer only, a folder a worker puts its checkouts under (else they are at the home's paths).
+$travelExchange = Setting 'travelExchange' ''
 $samePaths = @(Setting 'samePaths' @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:windir) | ForEach-Object { "$_" })
 $fingerprintCommands = @(Setting 'fingerprint' @() | ForEach-Object { "$_" })
-$homeRoot = Setting 'home' ''
+$travelLimitMB = [int](Setting 'travelLimitMB' 500)
+$travelCheckouts = Setting 'travelCheckouts' ''
 $computer = Setting 'computer' '' # (the computer this config belongs to: the lock refuses to run elsewhere with it)
 $travelStale = [int](Setting 'travelStale' 90) # (seconds without a heartbeat before the other side counts as gone)

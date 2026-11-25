@@ -31,6 +31,13 @@ if ($Shim) { Set-Content $Shim "@echo off`r`ncall `"$clone\lock\heavy.cmd`" %*`r
 if (-not (Test-Path $schedule)) { Set-Content $schedule @('HOLD: yes (closed on the board)', '# Line 1 is read by the heavy lock: "HOLD: yes" or "HOLD: no". machine-gate.ps1 writes it from the board.') -Encoding UTF8 }
 # (a running gate picks a new name up when restarted)
 Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*machine-gate.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+# (a gate an older setup registered under another name, from another copy of machine-gate.ps1, would answer
+# for this machine too: removed)
+foreach ($task in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -ne 'heavy-queue machine gate' -and (@($_.Actions) | ForEach-Object { "$($_.Arguments)" }) -match 'machine-gate\.ps1' }))
+{
+  Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Confirm:$false
+  "removed the older gate task '$($task.TaskName)'"
+}
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$clone\machine\machine-gate.ps1`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $taskSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries

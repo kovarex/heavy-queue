@@ -1,24 +1,30 @@
-# Jobs that travel (dot-sourced by heavy.ps1 and machine\worker.ps1). A machine whose folders other machines
-# see at the same paths (travelRoots: shared, and mapped there by machine\setup-worker.ps1) offers its waiting
-# jobs: an open, idle worker (a machine whose config names this one's data folder as its "home") claims the
-# oldest one it may run and runs it in the same folder, so the job sees the same files, git included. Its
-# output comes back to the waiting heavy.cmd as it is written, and so does its exit code: for the thread that
-# started it, the job ran, only elsewhere. Everything goes through files in the home's data folder:
-#   travel\ID.job.json   the offer: folder, command line, label, kind, thread, estimate, environment (no
-#                        secrets), the tool versions (fingerprint); ID is the queue ticket's name
-#   travel\ID.waiting    the home's waiter, every 3 s while it waits (a counter)
-#   travel\ID.claim      the machine that runs it, made with CreateNew: whoever makes it first runs the job,
-#                        the home itself included (it claims its own job before running it locally)
-#   travel\ID.alive      the worker, every 5 s (a counter and what it is doing)
-#   travel\ID.watch      the home's waiter, every 3 s while the job runs elsewhere (a counter)
-#   travel\ID.out, .err  the job's output
-#   travel\ID.exit       its exit code, then why when it did not finish ("1 stopped: ...")
-# A job travels only when nothing it names is elsewhere: its folder and every path in its command line are
-# under travelRoots (or samePaths, the same on every machine), it is not --local, and an --exclusive job
-# (a timing run) only with --travel. A worker takes it only with the same fingerprint (the config's
-# commands, such as the compiler's and Visual Studio's versions, give the same output there) and while no
-# other job runs in that folder anywhere. A worker that stops answering for 90 s ends the job with
-# "heavy: STOPPED"; a home waiter that goes away for 90 s makes the worker stop the job.
+# Jobs that travel (dot-sourced by heavy.ps1 and machine\worker.ps1). A job started with --travel from a git
+# checkout may run on another machine (a worker) while it waits here: the worker rebuilds the checkout's
+# exact state at the same path (the commit, the commits not on any remote, the uncommitted changes and the
+# new files; nothing git ignores, such as build folders) and runs the command there. Its output comes back to
+# the waiting heavy.cmd as it is written, then its exit code; no file comes back. So a job travels when its
+# result is its output and exit code (a gate, a test run) and it builds what it uses itself: a build whose
+# files the thread uses afterwards stays home. Everything goes through files in the exchange folder that
+# every machine sees (travelExchange, a NAS share):
+#   ID.job.json      the offer: machine, folder, command line, label, kind, thread, estimate, environment
+#                    (no secrets), the tool versions (the fingerprint commands and their output); ID is the
+#                    home's queue ticket's name
+#   ID.waiting       the home's waiter, every 3 s while it waits (a counter)
+#   ID.claim         the machine that runs it, made with CreateNew: whoever makes it first runs the job, the
+#                    home included (it claims its own job before running it locally)
+#   ID.state.json    the checkout's state, written by the home once claimed: its top folder, commit, branch,
+#   ID.bundle        remotes and remote branches, with the commits no remote has (a git bundle),
+#   ID.patch         the uncommitted changes (git diff --binary HEAD) and
+#   ID.new.tar       the new files git does not ignore; then
+#   ID.ready         (or ID.refused, the reason the job runs at home after all)
+#   ID.alive         the worker, every 5 s (a counter and what it is doing)
+#   ID.watch         the home's waiter, every 3 s while the job runs elsewhere (a counter)
+#   ID.out, ID.err   the job's output
+#   ID.exit          its exit code, then why when it did not finish ("1 stopped: ...")
+# ROOT\travel (this machine's own) keeps why a waiting job stays home (ID.stays), for the pages.
+# A worker takes a job only with the same fingerprint, and no --exclusive one on a no-benchmarks machine. A
+# worker that stops answering for travelStale seconds ends the job with "heavy: STOPPED"; a home waiter that
+# goes away for as long makes the worker stop the job.
 
 $travelDir = Join-Path $root 'travel'
 
@@ -37,20 +43,44 @@ function Under-Any([string]$path, $folders)
   return $false
 }
 
-# One folder inside the other (or the same): two jobs in such folders never run at once on two machines.
-function Folders-Overlap([string]$a, [string]$b)
+# A native command's output and exit code, nothing thrown (git writes progress to stderr).
+function Run-Quiet([string]$exe, [string[]]$arguments, [string]$folder = '')
 {
-  $ka = Folder-Key $a; $kb = Folder-Key $b
-  return $ka -and $kb -and ($ka.StartsWith($kb) -or $kb.StartsWith($ka))
+  $info = New-Object System.Diagnostics.ProcessStartInfo
+  $info.FileName = $exe
+  $info.Arguments = (@($arguments | ForEach-Object { if ($_ -match '[\s"]' -or $_ -eq '') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
+  $info.UseShellExecute = $false
+  $info.RedirectStandardOutput = $true
+  $info.RedirectStandardError = $true
+  $info.CreateNoWindow = $true
+  $info.StandardOutputEncoding = [Text.Encoding]::UTF8 # (git writes UTF-8)
+  $info.StandardErrorEncoding = [Text.Encoding]::UTF8
+  if ($folder) { $info.WorkingDirectory = $folder }
+  $p = [System.Diagnostics.Process]::Start($info)
+  $errTask = $p.StandardError.ReadToEndAsync()
+  $out = $p.StandardOutput.ReadToEnd()
+  $p.WaitForExit()
+  return [pscustomobject]@{ Code = $p.ExitCode; Out = $out; Err = $errTask.Result }
+}
+
+function Git([string]$folder, [string[]]$arguments) { return Run-Quiet 'git' (@('-C', $folder) + $arguments) }
+
+# The top folder of the git checkout a folder is in, or ''.
+function Git-Top([string]$folder)
+{
+  $r = Git $folder @('rev-parse', '--show-toplevel')
+  if ($r.Code -ne 0) { return '' }
+  return $r.Out.Trim().Replace('/', '\')
 }
 
 # Why this job may not travel, or '' when it may.
-function Travel-Refusal([string]$cwd, [string]$commandLine, [bool]$isExclusive, [bool]$forbid, [bool]$allow)
+function Travel-Refusal([string]$cwd, [string]$commandLine, [bool]$forbid, [bool]$allow)
 {
   if ($forbid) { return '--local' }
-  if (@($travelRoots).Count -eq 0) { return 'no travelRoots in the config' }
-  if ($isExclusive -and -not $allow) { return 'an --exclusive job travels only with --travel' }
-  if (-not (Under-Any $cwd $travelRoots)) { return "its folder is outside travelRoots" }
+  if (-not $allow) { return 'no --travel' }
+  if (-not $travelExchange) { return 'no travelExchange in the config' }
+  $top = Git-Top $cwd
+  if (-not $top) { return 'its folder is in no git checkout' }
   $expanded = [Environment]::ExpandEnvironmentVariables($commandLine)
   foreach ($m in [regex]::Matches($expanded, '"([^"]*)"|([^\s"]+)'))
   {
@@ -64,7 +94,7 @@ function Travel-Refusal([string]$cwd, [string]$commandLine, [bool]$isExclusive, 
     }
     foreach ($p in $paths)
     {
-      if (-not (Under-Any $p $travelRoots) -and -not (Under-Any $p $samePaths)) { return "it names $p, outside travelRoots" }
+      if (-not (Under-Any $p @($top)) -and -not (Under-Any $p $samePaths)) { return "it names $p, outside its checkout ($top)" }
     }
   }
   return ''
@@ -86,10 +116,11 @@ function Travel-Environment
   return $result
 }
 
-# The fingerprint commands' output: two machines run each other's jobs only when theirs are the same.
-function Fingerprint
+# The fingerprint commands' output: two machines run each other's jobs only when theirs are the same. A
+# worker runs the commands the offer names.
+function Fingerprint($commands = $fingerprintCommands)
 {
-  $parts = foreach ($c in @($fingerprintCommands))
+  $parts = foreach ($c in @($commands))
   {
     # (cmd /s /c "LINE": the outer quotes go, a quoted program path in LINE stays as it is)
     $info = New-Object System.Diagnostics.ProcessStartInfo
@@ -106,7 +137,12 @@ function Fingerprint
   return (@($parts) -join "`n")
 }
 
-function Travel-File([string]$id, [string]$ext) { return Join-Path $script:travelHere "$id.$ext" }
+# ID.stays is this machine's own (ROOT\travel), every other file is in the exchange.
+function Travel-File([string]$id, [string]$ext)
+{
+  if ($ext -eq 'stays') { return Join-Path $travelDir "$id.$ext" }
+  return Join-Path $travelExchange "$id.$ext"
+}
 
 function Try-Claim([string]$path, [string]$who)
 {
@@ -170,33 +206,180 @@ function Fresh([string]$path)
   return (($now - $last.Since).TotalSeconds -lt $travelStale)
 }
 
+$travelExts = 'job.json', 'stays', 'waiting', 'claim', 'state.json', 'bundle', 'patch', 'new.tar', 'ready', 'refused', 'alive', 'watch', 'out', 'err', 'exit'
 function Remove-Travel([string]$id)
 {
-  foreach ($ext in 'job.json', 'stays', 'parked', 'waiting', 'claim', 'alive', 'watch', 'out', 'err', 'exit')
-  {
-    Remove-Item (Travel-File $id $ext) -Force -ErrorAction SilentlyContinue
-  }
+  foreach ($ext in $travelExts) { Remove-Item (Travel-File $id $ext) -Force -ErrorAction SilentlyContinue }
 }
 
 # The travel files of this machine's jobs whose waiter died: gone, unless a worker still runs the job (it
 # notices that nobody watches, stops it and writes its exit; the next clearing takes them).
 function Clear-Dead-Offers
 {
-  foreach ($f in @(Get-ChildItem $travelDir -File -ErrorAction SilentlyContinue))
+  foreach ($f in @(Get-ChildItem $travelExchange -Filter '*.job.json' -File -ErrorAction SilentlyContinue) + @(Get-ChildItem $travelDir -Filter '*.stays' -File -ErrorAction SilentlyContinue))
   {
     if ($f.Name -notmatch '^(\d{20})-(\d+)\.') { continue }
     $id = "$($matches[1])-$($matches[2])"
-    if (Alive ([int]$matches[2])) { continue }
+    $owner = $f.Name.EndsWith('.stays') -or ((Read-Small $f.FullName) -match ('"machine":"' + [regex]::Escape($machine) + '"'))
+    if (-not $owner -or (Alive ([int]$matches[2]))) { continue }
     $who = Read-Small (Travel-File $id 'claim')
     if ($who -and $who -ne $machine -and -not (Test-Path (Travel-File $id 'exit'))) { continue }
     Remove-Travel $id
   }
 }
 
+# The home's side, once a worker claimed its job: the checkout's state into the exchange. Returns '' when it
+# is ready, else why the job runs here after all (ID.refused tells the worker).
+function Pack-State([string]$id, [string]$cwd)
+{
+  $why = ''
+  try
+  {
+    $top = Git-Top $cwd
+    if (-not $top) { throw 'its folder is in no git checkout now' }
+    $head = (Git $top @('rev-parse', 'HEAD')).Out.Trim()
+    $branch = (Git $top @('symbolic-ref', '--short', '-q', 'HEAD')).Out.Trim()
+    $remotes = [ordered]@{}
+    foreach ($r in ((Git $top @('remote')).Out -split "`n" | Where-Object { $_.Trim() }))
+    {
+      $remotes[$r.Trim()] = (Git $top @('remote', 'get-url', $r.Trim())).Out.Trim()
+    }
+    if ($remotes.Count -eq 0) { throw 'its checkout has no remote to fetch from' }
+    $refs = [ordered]@{}
+    foreach ($l in ((Git $top @('for-each-ref', 'refs/remotes', '--format=%(objectname) %(refname)')).Out -split "`n" | Where-Object { $_ -match '^[0-9a-f]{40} ' }))
+    {
+      $parts = $l.Trim() -split ' ', 2
+      if ($parts[1] -notmatch '/HEAD$') { $refs[$parts[1]] = $parts[0] }
+    }
+    $limit = [int64]$travelLimitMB * 1MB
+    # The commits no remote has.
+    $local = [int]((Git $top @('rev-list', '--count', 'HEAD', '--not', '--remotes')).Out.Trim())
+    if ($local -gt 0)
+    {
+      $r = Git $top @('bundle', 'create', (Travel-File $id 'bundle'), 'HEAD', '--not', '--remotes')
+      if ($r.Code -ne 0) { throw "git bundle: $($r.Err.Trim())" }
+    }
+    # The uncommitted changes, against HEAD (staged or not), written by git itself (bytes as they are).
+    $r = Git $top @('diff', '--binary', "--output=$(Travel-File $id 'patch')", 'HEAD')
+    if ($r.Code -ne 0) { throw "git diff: $($r.Err.Trim())" }
+    # The new files git does not ignore: their names as git writes them (NUL-separated bytes), to tar.
+    $list = Join-Path $env:TEMP "heavy-new-$PID.txt"
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = 'git'
+    $info.Arguments = "-C `"$top`" ls-files --others --exclude-standard -z"
+    $info.UseShellExecute = $false
+    $info.RedirectStandardOutput = $true
+    $info.CreateNoWindow = $true
+    $p = [System.Diagnostics.Process]::Start($info)
+    $bytes = New-Object IO.MemoryStream
+    $p.StandardOutput.BaseStream.CopyTo($bytes)
+    $p.WaitForExit()
+    if ($p.ExitCode -ne 0) { throw "git ls-files: exit $($p.ExitCode)" }
+    [IO.File]::WriteAllBytes($list, $bytes.ToArray())
+    $new = (Get-Item -LiteralPath $list).Length -gt 0
+    if ($new)
+    {
+      $r = Run-Quiet "$env:windir\System32\tar.exe" @('-cf', (Travel-File $id 'new.tar'), '-C', $top, '--null', '-T', $list)
+      if ($r.Code -ne 0) { throw "tar: $($r.Err.Trim())" }
+    }
+    Remove-Item $list -Force -ErrorAction SilentlyContinue
+    $size = (Get-Item -LiteralPath (Travel-File $id 'patch')).Length
+    if ($new) { $size += (Get-Item -LiteralPath (Travel-File $id 'new.tar')).Length }
+    if ($size -gt $limit) { throw "its uncommitted state weighs $([int]($size / 1MB)) MB, over travelLimitMB ($travelLimitMB)" }
+    $state = [ordered]@{ top = $top; cwd = $cwd; head = $head; branch = $branch; remotes = $remotes; refs = $refs; bundle = ($local -gt 0); new = $new }
+    Write-Shared (Travel-File $id 'state.json') ($state | ConvertTo-Json -Depth 4 -Compress)
+    Write-Shared (Travel-File $id 'ready') 'ready'
+  }
+  catch
+  {
+    $why = "$($_.Exception.Message)"
+    Write-Shared (Travel-File $id 'refused') $why
+  }
+  return $why
+}
+
+# A worker's folder for one of the home's: the same path, or under travelCheckouts (testing on one computer).
+function Worker-Path([string]$path)
+{
+  if (-not $travelCheckouts) { return $path }
+  return Join-Path $travelCheckouts ($path -replace '^([A-Za-z]):', '$1')
+}
+
+# The worker's side: the checkout at the home's state, at its path here; returns the job's folder here. A
+# folder in the way that is not a checkout this worker made (.git\heavy-queue-worker) is renamed aside, never
+# deleted. The remotes' commits come from a bare mirror of each remote kept in ROOT\mirrors, so a second
+# checkout of a big repository fetches only what is new.
+function Prepare-Checkout([string]$id)
+{
+  $state = (Read-Small (Travel-File $id 'state.json')) | ConvertFrom-Json
+  $top = Worker-Path $state.top
+  if ($top.Length -lt 6) { throw "refused to work at $top" }
+  $mark = Join-Path $top '.git\heavy-queue-worker'
+  if ((Test-Path -LiteralPath $top) -and -not (Test-Path -LiteralPath $mark))
+  {
+    $aside = "$top.local-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    Rename-Item -LiteralPath $top -NewName (Split-Path -Leaf $aside)
+  }
+  $origin = @($state.remotes.PSObject.Properties)[0]
+  $mirror = Join-Path $root ("mirrors\" + (($origin.Value -replace '[^A-Za-z0-9]+', '-').Trim('-')) + '.git')
+  if (-not (Test-Path -LiteralPath $mirror))
+  {
+    $r = Run-Quiet 'git' @('clone', '--mirror', '--quiet', $origin.Value, $mirror)
+    if ($r.Code -ne 0) { throw "git clone --mirror $($origin.Value): $($r.Err.Trim())" }
+  }
+  else
+  {
+    $r = Git $mirror @('fetch', '--prune', '--quiet')
+    if ($r.Code -ne 0) { throw "git fetch in $($mirror): $($r.Err.Trim())" }
+  }
+  if (-not (Test-Path -LiteralPath $mark))
+  {
+    New-Item -ItemType Directory -Force (Split-Path $top) | Out-Null
+    $r = Run-Quiet 'git' @('clone', '--no-checkout', '--quiet', '--reference', $mirror, $origin.Value, $top)
+    if ($r.Code -ne 0) { throw "git clone $($origin.Value): $($r.Err.Trim())" }
+    Set-Content -LiteralPath $mark -Value 'a checkout heavy-queue''s worker made: it is set to a home''s state for each job' -Encoding ascii
+  }
+  foreach ($remote in $state.remotes.PSObject.Properties)
+  {
+    if ((Git $top @('remote', 'get-url', $remote.Name)).Code -ne 0) { [void](Git $top @('remote', 'add', $remote.Name, $remote.Value)) }
+    else { [void](Git $top @('remote', 'set-url', $remote.Name, $remote.Value)) }
+    $r = Git $top @('fetch', '--prune', '--quiet', $remote.Name)
+    if ($r.Code -ne 0) { throw "git fetch $($remote.Name): $($r.Err.Trim())" }
+  }
+  if ($state.bundle)
+  {
+    $r = Git $top @('fetch', '--quiet', (Travel-File $id 'bundle'), 'HEAD')
+    if ($r.Code -ne 0) { throw "git fetch from the bundle: $($r.Err.Trim())" }
+  }
+  # The remote branches as the home has them (a gate compares with origin/master as the home last fetched it).
+  foreach ($ref in $state.refs.PSObject.Properties)
+  {
+    $r = Git $top @('update-ref', $ref.Name, $ref.Value)
+    if ($r.Code -ne 0) { throw "git update-ref $($ref.Name): $($r.Err.Trim())" }
+  }
+  $r = if ($state.branch) { Git $top @('checkout', '--quiet', '--force', '-B', $state.branch, $state.head) } else { Git $top @('checkout', '--quiet', '--force', '--detach', $state.head) }
+  if ($r.Code -ne 0) { throw "git checkout $($state.head): $($r.Err.Trim())" }
+  # Nothing of the job before: no untracked or ignored file (a stale build would be tested otherwise).
+  $r = Git $top @('clean', '-ffdxq')
+  if ($r.Code -ne 0) { throw "git clean: $($r.Err.Trim())" }
+  $patch = Travel-File $id 'patch'
+  if ((Get-Item -LiteralPath $patch).Length -gt 0)
+  {
+    $r = Git $top @('apply', '--binary', '--whitespace=nowarn', $patch)
+    if ($r.Code -ne 0) { throw "git apply: $($r.Err.Trim())" }
+  }
+  if ($state.new)
+  {
+    $r = Run-Quiet "$env:windir\System32\tar.exe" @('-xf', (Travel-File $id 'new.tar'), '-C', $top)
+    if ($r.Code -ne 0) { throw "tar: $($r.Err.Trim())" }
+  }
+  return (Worker-Path $state.cwd)
+}
+
 # On a worker, the lock that runs a travelled job and everything it starts are in one job object that kills
 # them all when the lock's process ends: a lock killed mid-job (its home then reports it stopped, and the
-# thread runs it again) leaves nothing running in the shared folder. At the job's normal end the kill is
-# switched off, so what it leaves running on purpose (a compile server) stays.
+# thread runs it again) leaves nothing running. At the job's normal end the kill is switched off, so what it
+# leaves running on purpose (a compile server) stays.
 function Kill-With-Me([bool]$on)
 {
   if (-not ('HeavyQueueJob' -as [type]))
@@ -251,6 +434,11 @@ function Follow-Remote([string]$id, [string]$worker)
     $outAt = Pump (Travel-File $id 'out') $outAt $stdout
     $errAt = Pump (Travel-File $id 'err') $errAt $stderr
     $exit = Read-Small (Travel-File $id 'exit')
+    if ($exit -match '^notrun')
+    {
+      $errAt = Pump (Travel-File $id 'err') $errAt $stderr
+      return $null # (the worker could not make the checkout: the job runs here)
+    }
     if ($exit)
     {
       Start-Sleep -Milliseconds 300

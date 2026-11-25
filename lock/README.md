@@ -1,6 +1,6 @@
 # The lock
 
-    lock\heavy.cmd [--exclusive] [--name TEXT] [--estimate 90s, 10m or 2h] COMMAND LINE...
+    lock\heavy.cmd [--exclusive] [--name TEXT] [--estimate 90s, 10m or 2h] [--travel] COMMAND LINE...
     lock\heavy.cmd --detach [--log FILE] [the same options] COMMAND LINE...
     lock\heavy.cmd --status
 
@@ -45,31 +45,36 @@ a Claude Code session an hour after its last turn and ends every process the ses
 
 ## Jobs that travel
 
-A waiting job may run on another machine, a worker, in the same folder: the worker sees this machine's
-folders at the same paths (machine\share-home.ps1 shares them here, machine\setup-worker.ps1 maps them
-there), so the job sees the same files, git included, and nothing is copied. For whoever started it, the
-job ran as before: its output comes back to heavy.cmd as it is written, then its exit code, with a line
-saying where it ran.
+A job started with `--travel` from a git checkout may run on another machine, a worker, while it waits
+here. Once a worker claims it, this machine puts the checkout's exact state into the exchange folder both
+see (`travelExchange`, a NAS share): its commit, the commits no remote has (a git bundle), the uncommitted
+changes and the new files git does not ignore. The worker makes the same checkout at the same path (from a
+mirror of the remote it keeps, so a second time fetches only what is new), clears everything git ignores
+there (a stale build would be tested otherwise), and runs the command in the same folder of it. For whoever
+started it, the job ran as before: its output comes back to heavy.cmd as it is written, then its exit
+code, with a line saying where it ran. No file comes back.
 
-- **Which jobs:** a job travels when its folder and every path in its command line are in `travelRoots`
-  (or `samePaths`, the same on every machine). `--local` keeps a job here. An `--exclusive` job (a timing
-  run) travels only with `--travel`, as its numbers would come from another machine. The pages say why a
-  waiting job stays ("stays here: ...") or that it may travel.
+- **Which jobs:** `--travel` from a folder in a git checkout whose command line names nothing outside the
+  checkout (or `samePaths`, the same on every machine): a job whose result is its output and exit code (a
+  gate, a test run) and that builds what it uses itself (`--travel cmd /c "build.cmd && gate.cmd"`). A
+  build whose files the thread uses afterwards stays here (no `--travel`). The pages say why a job asked to
+  travel stays ("stays here: ...") or that it may travel.
 - **Which worker:** an open worker whose slot is free and that has nothing queued claims the oldest job it
-  may run: same tools (the `fingerprint` commands' output, checked again right before it claims), no
-  `--exclusive` job on a no-benchmarks machine, and no job running anywhere in the same folder (or one
-  inside the other) or for the same thread. A thread's jobs ran one after another here; they still do,
-  wherever they run. Whoever claims first runs the job, this machine included (a claim is a file made with
-  CreateNew).
+  may run: the same tools (the offer names its `fingerprint` commands and their output here; the worker runs
+  the same commands, again right before it claims), and no `--exclusive` job on a no-benchmarks machine.
+  Whoever claims first runs the job, this machine included (a claim is a file made with CreateNew).
 - **What it takes along:** the command line, the folder, the label, the thread, the estimate and the
   environment, without what names this machine (COMPUTERNAME, TEMP, ...) and without secrets (any variable
   whose name has TOKEN, SECRET, PASSWORD, KEY, AUTH, CREDENTIAL, ...): a worker keeps its own.
+- **When it cannot go:** uncommitted state over `travelLimitMB` (500), or a worker that cannot make the
+  checkout (its remote out of reach): the job runs here after all, in its place in the line, and says so.
 - **When something dies:** a worker that stops answering for `travelStale` seconds (90) ends the job here
   with `heavy: STOPPED: ... Run it again.` and exit 1; its lock and everything the job started are in a job
-  object that ends with the lock, so nothing keeps running in the shared folder. A waiter here that goes
-  away makes the worker stop the job.
-- **Files:** `ROOT\travel\ID.*` (lock\travel.ps1 lists them). The worker writes its note (what it does, or
-  why it takes nothing, such as other tools) to its `ROOT\worker.txt`, which its pages and the board show.
+  object that ends with the lock, so nothing keeps running there. A waiter here that goes away makes the
+  worker stop the job.
+- **Files:** `EXCHANGE\ID.*` (lock\travel.ps1 lists them); a worker's checkouts are at the homes' paths, a
+  folder of its own in the way renamed aside, never deleted. The worker writes its note (what it does, or why
+  it takes nothing, such as other tools) to its `ROOT\worker.txt`, which its pages and the board show.
 
 ## Who started a job
 
@@ -112,8 +117,9 @@ default:
 | idleLoad | `--exclusive`: idle below this total CPU percent | 15 |
 | idleSeconds | `--exclusive`: for this many seconds in a row | 20 |
 | computer | the computer this config belongs to: the lock refuses to run on another with it | none |
-| travelRoots | this machine's folders that workers see at the same paths: jobs in them may travel | none (nothing travels) |
+| travelExchange | the folder every machine sees (a NAS share) through which jobs travel | none (nothing travels) |
 | samePaths | paths that are the same on every machine, which a travelling job may name | Program Files, Windows |
 | fingerprint | commands whose output must be the same on two machines for one to run the other's jobs | none |
-| home | on a worker: its home's data folder, as the worker sees it | none (not a worker) |
+| travelLimitMB | the most a travelling job's uncommitted state (changes, new files) may weigh | 500 |
+| travelCheckouts | on a worker, for testing two machines on one computer: where its checkouts go instead of the homes' paths | none |
 | travelStale | seconds without a heartbeat before the other side of a travelled job counts as gone | 90 |
