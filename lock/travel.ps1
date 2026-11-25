@@ -137,6 +137,68 @@ function Fingerprint($commands = $fingerprintCommands)
   return (@($parts) -join "`n")
 }
 
+# Tools a worker takes from its home (travelTools, such as a compiler installed from an unreleased build): a
+# folder's identity is a hash of its files' names, sizes and times. The home puts a copy of each folder into
+# EXCHANGE\tools\NAME-ID once; a worker mirrors it over its own folder at the same path (stopping what runs
+# from there first) when the offer's ID differs from its own (PATH\.heavy-queue-tool), then compares tools.
+$toolMark = '.heavy-queue-tool'
+function Tool-Id([string]$folder)
+{
+  $sha = [Security.Cryptography.SHA256]::Create()
+  $text = New-Object System.Text.StringBuilder
+  $base = (Resolve-Path -LiteralPath $folder).Path.TrimEnd('\').Length + 1
+  foreach ($f in @(Get-ChildItem -LiteralPath $folder -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne $toolMark } | Sort-Object FullName))
+  {
+    [void]$text.Append("$($f.FullName.Substring($base))|$($f.Length)|$($f.LastWriteTimeUtc.Ticks)`n")
+  }
+  $hash = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($text.ToString()))
+  return (-join ($hash[0..7] | ForEach-Object { $_.ToString('x2') }))
+}
+
+function Tool-Copy([string]$folder, [string]$id) { return Join-Path $travelExchange ("tools\" + ((Split-Path -Leaf $folder) -replace '[^A-Za-z0-9.-]', '_') + "-$id") }
+
+# The home's side, at offer time: each travelTools folder with its identity, its copy in the exchange made
+# when missing (robocopy, then a done file).
+function Offer-Tools
+{
+  $tools = @()
+  foreach ($folder in @($travelTools))
+  {
+    if (-not (Test-Path -LiteralPath $folder)) { continue }
+    $id = Tool-Id $folder
+    $copy = Tool-Copy $folder $id
+    if (-not (Test-Path -LiteralPath (Join-Path $copy '.done')))
+    {
+      & robocopy $folder $copy /MIR /R:2 /W:2 /NFL /NDL /NJH /NJS /NP /XF $toolMark | Out-Null
+      if ($LASTEXITCODE -ge 8) { continue } # (no copy: workers keep their own and compare tools as they are)
+      Set-Content -LiteralPath (Join-Path $copy '.done') -Value $id -Encoding ascii
+    }
+    $tools += [ordered]@{ path = $folder; id = $id }
+  }
+  return ,$tools
+}
+
+# The worker's side, before it compares tools for an offer: its folders brought to the offer's IDs. Returns
+# '' or why not (the note on the board).
+function Take-Tools($tools)
+{
+  foreach ($t in @($tools))
+  {
+    $mark = Join-Path $t.path $toolMark
+    if ((Read-Small $mark) -eq $t.id) { continue }
+    $copy = Tool-Copy $t.path $t.id
+    if (-not (Test-Path -LiteralPath (Join-Path $copy '.done'))) { return "the home's copy of $($t.path) is not in the exchange" }
+    # (what runs from that folder holds its files: a compile server from an earlier job)
+    $key = (Folder-Key $t.path)
+    Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and (Folder-Key (Split-Path $_.ExecutablePath)).StartsWith($key) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 1
+    & robocopy $copy $t.path /MIR /R:3 /W:2 /NFL /NDL /NJH /NJS /NP /XF '.done' $toolMark | Out-Null
+    if ($LASTEXITCODE -ge 8) { return "could not copy $($t.path) from the exchange (robocopy $LASTEXITCODE; this worker needs to run as administrator for Program Files)" }
+    Set-Content -LiteralPath $mark -Value $t.id -Encoding ascii
+  }
+  return ''
+}
+
 # ID.stays is this machine's own (ROOT\travel), every other file is in the exchange.
 function Travel-File([string]$id, [string]$ext)
 {

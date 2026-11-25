@@ -570,7 +570,7 @@ if (-not $travelled)
     Clear-Dead-Offers
     $guess = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
     $job = [ordered]@{ id = $ticketName; machine = $machine; pid = $PID; cwd = (Get-Location).Path; line = $line; label = $label; kind = $kind; thread = $thread
-      estimate = $(if ($guess) { $guess.seconds } else { $null }); queued = (Iso $queuedAt); fingerprintCommands = @($fingerprintCommands); fingerprint = (Fingerprint); env = (Travel-Environment) }
+      estimate = $(if ($guess) { $guess.seconds } else { $null }); queued = (Iso $queuedAt); fingerprintCommands = @($fingerprintCommands); tools = (Offer-Tools); fingerprint = (Fingerprint); env = (Travel-Environment) }
     Beat (Travel-File $ticketName 'waiting') 'waiting'
     Write-Shared (Travel-File $ticketName 'job.json') ($job | ConvertTo-Json -Depth 3 -Compress)
     $offer = $ticketName

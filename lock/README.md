@@ -66,6 +66,9 @@ code, with a line saying where it ran. No file comes back.
 - **What it takes along:** the command line, the folder, the label, the thread, the estimate and the
   environment, without what names this machine (COMPUTERNAME, TEMP, ...) and without secrets (any variable
   whose name has TOKEN, SECRET, PASSWORD, KEY, AUTH, CREDENTIAL, ...): a worker keeps its own.
+- **Tools that come along:** folders in `travelTools` (such as `C:\Program Files\kpp`, installed from an
+  unreleased build) are copied into the exchange once per version, and a worker mirrors the home's version
+  over its own at the same path before comparing tools, stopping what runs from there first.
 - **When it cannot go:** uncommitted state over `travelLimitMB` (500), or a worker that cannot make the
   checkout (its remote out of reach): the job runs here after all, in its place in the line, and says so.
 - **When something dies:** a worker that stops answering for `travelStale` seconds (90) ends the job here
@@ -121,5 +124,6 @@ default:
 | samePaths | paths that are the same on every machine, which a travelling job may name | Program Files, Windows |
 | fingerprint | commands whose output must be the same on two machines for one to run the other's jobs | none |
 | travelLimitMB | the most a travelling job's uncommitted state (changes, new files) may weigh | 500 |
+| travelTools | folders a worker takes from its home when its own differ, mirrored at the same path (such as a compiler installed from an unreleased build); the worker runs elevated for Program Files | none |
 | travelCheckouts | on a worker, for testing two machines on one computer: where its checkouts go instead of the homes' paths | none |
 | travelStale | seconds without a heartbeat before the other side of a travelled job counts as gone | 90 |

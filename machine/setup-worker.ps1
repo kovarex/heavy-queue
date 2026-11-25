@@ -34,6 +34,8 @@ Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*machine\wo
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$clone\machine\worker.ps1`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $taskSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName 'heavy-queue worker' -Action $action -Trigger $trigger -Settings $taskSettings -Force | Out-Null
+# (highest privileges: it mirrors the home's travelTools over its own, such as C:\Program Files\kpp)
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
+Register-ScheduledTask -TaskName 'heavy-queue worker' -Action $action -Trigger $trigger -Settings $taskSettings -Principal $principal -Force | Out-Null
 Start-ScheduledTask -TaskName 'heavy-queue worker'
 'worker started (scheduled task "heavy-queue worker"). Open this machine on the board; what the worker does, or why it takes nothing, shows on its card.'
