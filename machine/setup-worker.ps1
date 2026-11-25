@@ -2,8 +2,9 @@
 # in the same folders, which this script maps here at the same paths (directory links to the home's shares:
 # machine\share-home.ps1 makes them). Run once, as administrator, in this computer's clone of heavy-queue
 # (not inside one of the mapped folders):
-#   powershell -ExecutionPolicy Bypass -File machine\setup-worker.ps1 -HomeName PC-HOME -HomeData C:\...\heavy -PublishFile PATH [-User NAME] [-Name NAME] [-NoBenchmarks]
-# -HomeName: the home's computer name. -HomeData: the home's data folder (its config's root), which must lie
+#   powershell -ExecutionPolicy Bypass -File machine\setup-worker.ps1 -HomeName PC-HOME -Shares a,b -HomeData C:\...\heavy -PublishFile PATH [-User NAME] [-Name NAME] [-NoBenchmarks]
+# -HomeName: the home's computer name. -Shares: the shares share-home.ps1 made there (each travelRoot's folder
+#   name; share-home.ps1 lists them). -HomeData: the home's data folder (its config's root), which must lie
 #   in one of its shared folders. -PublishFile, -Name, -NoBenchmarks: as machine\setup-machine.ps1, which
 #   this runs too (this machine's own lock, its gate and the board).
 # -User: the home's user for its shares (asked when not given; the password is always typed by you).
@@ -21,6 +22,7 @@
 # 6. setup-machine.ps1, then the scheduled task "heavy-queue worker" (machine\worker.ps1 at logon).
 param(
   [Parameter(Mandatory = $true)][string]$HomeName,
+  [Parameter(Mandatory = $true)][string[]]$Shares,
   [Parameter(Mandatory = $true)][string]$HomeData,
   [Parameter(Mandatory = $true)][string]$PublishFile,
   [string]$User = '',
@@ -31,20 +33,18 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'run this as administrator (directory links need it)' }
 $clone = Split-Path $PSScriptRoot
 
-# 1. The sign-in for the home's shares.
-# (only the shares share-home.ps1 made: their comment says heavy-queue)
-# (through cmd: "access denied" before the sign-in is stored is an answer, and PowerShell 5.1 with
-# ErrorActionPreference Stop would make net's stderr an error even when sent to $null)
-function Home-Shares { return @(& $env:ComSpec /d /c "net view \\$HomeName 2>nul" | Where-Object { $_ -match '^(\S+)\s+Disk.*heavy-queue' } | ForEach-Object { ($_ -split '\s+')[0] }) }
-$shares = Home-Shares
-if ($shares.Count -eq 0)
+# 1. The sign-in for the home's shares: asked for once when they cannot be read yet. (Each share is tried
+# by its path: net view's list needs the old browser service, "System error 1702" where it is off.)
+function Missing-Shares { return @($Shares | Where-Object { -not (Test-Path -LiteralPath "\$HomeName\$_") }) }
+if ((Missing-Shares).Count -gt 0)
 {
-  if (-not $User) { $User = Read-Host "The user for \\$HomeName's shares (its local user, or MicrosoftAccount\your@e-mail)" }
+  if (-not $User) { $User = Read-Host "The user for \$HomeName's shares (its local user, or MicrosoftAccount\your@e-mail)" }
   & cmdkey "/add:$HomeName" "/user:$User" /pass
-  $shares = Home-Shares
-  if ($shares.Count -eq 0) { throw "\\$HomeName shows no heavy-queue shares: is machine\share-home.ps1 run there, is it on, and is the sign-in right?" }
+  $missing = Missing-Shares
+  if ($missing.Count -gt 0) { throw "cannot read \$HomeName\$($missing -join ', \' + $HomeName + '\'): is machine\share-home.ps1 run there, is it on, and is the sign-in right?" }
 }
-"shares of \\$($HomeName): $($shares -join ', ')"
+$shares = $Shares
+"shares of \$($HomeName): $($shares -join ', ')"
 
 # 2. What would run the home's scripts once its folders are here.
 $mapped = @($shares | ForEach-Object { "c:\$($_.ToLowerInvariant())\" })
