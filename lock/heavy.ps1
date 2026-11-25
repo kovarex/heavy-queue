@@ -38,6 +38,9 @@ $mayTravel = $false
 $travelledFile = ''
 $detach = $false
 $logGiven = ''
+$threadGiven = $null
+$shownGiven = ''
+$watch = $false
 while ($true)
 {
   if ($line -match '^--detach(\s+|$)(.*)$') { $detach = $true; $line = $matches[2]; continue }
@@ -50,11 +53,18 @@ while ($true)
   if ($line -match '^--name\s+(\S+)\s*(.*)$') { $name = $matches[1]; $line = $matches[2]; continue }
   if ($line -match '^--local(\s+|$)(.*)$') { $stayHere = $true; $line = $matches[2]; continue }
   if ($line -match '^--travel(\s+|$)(.*)$') { $mayTravel = $true; $line = $matches[2]; continue }
+  # (a Claude Code thread's title: lock\threads.ps1)
+  if ($line -match '^--thread\s+"([^"]*)"\s*(.*)$') { $threadGiven = $matches[1]; $line = $matches[2]; continue }
+  if ($line -match '^--thread\s+(\S+)\s*(.*)$') { $threadGiven = $matches[1]; $line = $matches[2]; continue }
+  if ($line -match '^--shown\s+(none|waiting|running)(\s+|$)(.*)$') { $shownGiven = $matches[1]; $line = $matches[3]; continue }
+  if ($line -match '^--watch(\s+|$)(.*)$') { $watch = $true; $line = $matches[2]; continue }
   # (machine\worker.ps1: run another machine's job, claimed for this one)
   if ($line -match '^--run-travelled\s+"([^"]+)"\s*$') { $travelledFile = $matches[1]; $line = ''; continue }
   break
 }
 . (Join-Path $PSScriptRoot 'travel.ps1')
+. (Join-Path $PSScriptRoot 'threads.ps1')
+$session = Job-Session
 
 # Writes a file other jobs read all the time (holder.txt, the queue's, the flag): a reader holding it
 # open for a moment made Set-Content fail and the job end ("being used by another process", 2026-11-23),
@@ -136,6 +146,9 @@ function Owner([string]$thread, [string]$cwd) { if ($thread) { return $thread } 
 function Thread-Title
 {
   if ($env:HEAVY_QUEUE_THREAD) { return ($env:HEAVY_QUEUE_THREAD -replace '[:\t\r\n]', '-') }
+  # (the title the thread gave with --thread: the app's session title is the one it started with)
+  $given = Thread-Given-Title (Job-Session)
+  if ($given) { return $given }
   $id = $env:CLAUDE_CODE_HOST_SESSION_ID
   if (-not $id) { return '' }
   try
@@ -158,15 +171,18 @@ function Who([string]$cwd)
   return $cwd
 }
 
-# "pid N, KIND, since MM-dd HH:mm:ss, cwd DIR[, thread TITLE][, estimate Ns]: LABEL" (holder.txt and the
-# queue's files; the estimate is there only when the job gave one with --estimate)
+# "pid N, KIND, since MM-dd HH:mm:ss, cwd DIR[, thread TITLE][, session ID][, estimate Ns]: LABEL" (holder.txt
+# and the queue's files; the estimate is there only when the job gave one with --estimate; the session is the
+# Claude session that started it, lock\threads.ps1). A thread that gave its title (--thread) is shown by it.
 function Parse-Record([string]$text)
 {
-  if ($text -notmatch '^pid (\d+), (\w+), since (\d\d-\d\d \d\d:\d\d:\d\d), cwd (.*?)(?:, thread (.*?))?(?:, estimate (\d+)s)?: (.*)$') { return $null }
+  if ($text -notmatch '^pid (\d+), (\w+), since (\d\d-\d\d \d\d:\d\d:\d\d), cwd (.*?)(?:, thread (.*?))?(?:, session ([\w-]+))?(?:, estimate (\d+)s)?: (.*)$') { return $null }
   $since = [DateTime]::ParseExact("$((Get-Date).Year)-$($matches[3])", 'yyyy-MM-dd HH:mm:ss', $null)
   if ($since -gt (Get-Date).AddDays(1)) { $since = $since.AddYears(-1) }
-  $est = if ($matches[6]) { [int]$matches[6] } else { $null }
-  return [pscustomobject]@{ Pid = [int]$matches[1]; Kind = $matches[2]; Since = $since; Cwd = $matches[4]; Thread = $matches[5]; Given = $est; Label = $matches[7].Trim() }
+  $est = if ($matches[7]) { [int]$matches[7] } else { $null }
+  $who = $matches[5]; $sid = $matches[6]; $what = $matches[8].Trim()
+  if ($sid) { $given = Thread-Given-Title $sid; if ($given) { $who = $given } }
+  return [pscustomobject]@{ Pid = [int]$matches[1]; Kind = $matches[2]; Since = $since; Cwd = $matches[4]; Thread = $who; Session = $sid; Given = $est; Label = $what }
 }
 
 # Time estimates. A job's estimate is, in this order: what it gave with --estimate; else the median of
@@ -436,6 +452,32 @@ tick(); setInterval(tick, 1000);
 
 if ($status) { Show-Status; Write-Page; exit 0 }
 
+# A Claude Code thread's title (lock\threads.ps1): --thread TITLE records its plain title (the pages show it),
+# --shown STATE what its title shows now, --watch waits until its jobs' state differs from that and says what to
+# do. With a command line after them, --thread only records the title and the job runs as usual.
+if ($null -ne $threadGiven -or $shownGiven -or $watch)
+{
+  $heavyCmd = if ($env:HEAVY_QUEUE_CALLED_AS) { $env:HEAVY_QUEUE_CALLED_AS } else { Join-Path $PSScriptRoot 'heavy.cmd' }
+  if (-not $session) { [Console]::Error.WriteLine('heavy: no session (neither HEAVY_QUEUE_SESSION nor CLAUDE_CODE_HOST_SESSION_ID): no thread to record.'); if ($shownGiven -or $watch -or -not $line) { exit 2 } }
+  if ($session -and $null -ne $threadGiven) { $t = ($threadGiven -replace '^\s*(\u23F3|\u2699\uFE0F?)\s*', '').Trim(); Save-Thread-Record $session @{ title = $t } }
+  if ($line -and ($shownGiven -or $watch)) { [Console]::Error.WriteLine('heavy: --shown and --watch take no command line.'); exit 2 }
+  if ($watch)
+  {
+    [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    $from = if ($shownGiven) { $shownGiven } else { $r = Thread-Record $session; if ($r -and $r.shown) { "$($r.shown)" } else { 'none' } }
+    Watch-Session $session $from '' $heavyCmd
+    exit 0
+  }
+  if ($shownGiven) { Save-Thread-Record $session @{ shown = $shownGiven } }
+  if (-not $line)
+  {
+    [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    $r = Thread-Record $session
+    "heavy: thread $session, title `"$($r.title)`", shown $($r.shown), its jobs $((Session-State $session).State)."
+    exit 0
+  }
+}
+
 # A waiting detached job is data, no process: its job file (ROOT\detached\ID.json: folder, command line,
 # log, environment) and its place in the line (queue\TICKS-ID-eSECONDS[-p].txt, ID = dDATExPID). One
 # dispatcher per machine (this script with --dispatch, started when such a job is queued or found waiting)
@@ -502,7 +544,7 @@ if ($line -eq '--dispatch')
 # --help, -h, /? or any option this lock does not know: the usage, never a job (three threads queued "--help"
 # as a command line, 2026-11-25).
 if ($line -match '^(--\S*|-h|-\?|/\?|/h|/help)(\s|$)') { [Console]::Error.WriteLine("heavy: $(if ($matches[1] -match '^(--help|-h|-\?|/\?|/h|/help)$') { 'usage' } else { "unknown option $($matches[1])" })"); $line = '' }
-if (-not $line -and -not $travelledFile) { 'usage:heavy.cmd [--detach [--log FILE]] [--exclusive] [--name TEXT] [--estimate 90s|10m|2h] [--local | --travel] COMMAND LINE...  |  heavy.cmd --status'; exit 2 }
+if (-not $line -and -not $travelledFile) { 'usage:heavy.cmd [--detach [--log FILE]] [--exclusive] [--name TEXT] [--estimate 90s|10m|2h] [--local | --travel] [--thread TITLE] COMMAND LINE...  |  heavy.cmd --status  |  heavy.cmd [--thread TITLE] [--shown none|waiting|running] [--watch]'; exit 2 }
 if ($logGiven -and -not $detach) { [Console]::Error.WriteLine('heavy: --log goes with --detach.'); exit 2 }
 
 # --detach: the same job, started by WMI (so its parent is WMI's service, not this process: whatever ends
@@ -535,13 +577,14 @@ if ($detach)
   }
   if ($env:HEAVY_QUEUE_CONFIG) { $environment['HEAVY_QUEUE_CONFIG'] = $env:HEAVY_QUEUE_CONFIG }
   if ($env:HEAVY_QUEUE_THREAD) { $environment['HEAVY_QUEUE_THREAD'] = $env:HEAVY_QUEUE_THREAD }
+  if ($session) { $environment['HEAVY_QUEUE_SESSION'] = $session }
   New-Item -ItemType Directory -Force (Split-Path $log) | Out-Null
   Remove-Item -LiteralPath "$log.exit" -Force -ErrorAction SilentlyContinue
   [IO.File]::WriteAllText($log, '', (New-Object System.Text.UTF8Encoding($false)))
   # (waiting, it is data: this job file and its place in the line; the dispatcher starts its process)
   $dataId = 'd{0}x{1}' -f (Get-Date -Format 'yyyyMMddHHmmss'), $PID
   $jobFile = Join-Path $detachDir "$dataId.json"
-  $job = [ordered]@{ cwd = (Get-Location).Path; line = $whole; log = $log; env = $environment }
+  $job = [ordered]@{ cwd = (Get-Location).Path; line = $whole; log = $log; env = $environment; session = $session }
   Write-Shared $jobFile ($job | ConvertTo-Json -Depth 3 -Compress)
   $dLabel = if ($name) { $name } else { $line }
   if ($dLabel.Length -gt 160) { $dLabel = $dLabel.Substring(0, 160) + '...' }
@@ -554,7 +597,7 @@ if ($detach)
   $dTicks = [DateTime]::UtcNow.Ticks
   New-Item -ItemType Directory -Force $queueDir | Out-Null
   $entry = Join-Path $queueDir ('{0:D20}-{1}-e{2}{3}.txt' -f $dTicks, $dataId, $(if ($dGuess) { [int]$dGuess.seconds } else { [int]$unknownEstimate }), $(if ($dFirst) { '-p' } else { '' }))
-  $dMe = "pid 0, $dKind, since {0}, cwd {1}" + $(if ($dThread) { ", thread " + ($dThread -replace '\{', '{{' -replace '\}', '}}') }) + $(if ($null -ne $dGiven) { ", estimate $($dGiven)s" }) + ': {2}'
+  $dMe = "pid 0, $dKind, since {0}, cwd {1}" + $(if ($dThread) { ", thread " + ($dThread -replace '\{', '{{' -replace '\}', '}}') }) + $(if ($session) { ", session $session" }) + $(if ($null -ne $dGiven) { ", estimate $($dGiven)s" }) + ': {2}'
   Write-Shared $entry ($dMe -f (Get-Date).ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $dLabel)
   Ensure-Dispatcher
   $wake = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, "$mutexName-changed")
@@ -660,7 +703,7 @@ if ($given)
   $givenSeconds = Parse-Seconds $given
   if ($null -eq $givenSeconds) { [Console]::Error.WriteLine("heavy: --estimate takes a time such as 90s, 10m or 2h, not '$given'."); exit 2 }
 }
-$me = "pid $PID, $kind, since {0}, cwd {1}" + $(if ($thread) { ", thread " + ($thread -replace '\{', '{{' -replace '\}', '}}') }) + $(if ($null -ne $givenSeconds) { ", estimate $($givenSeconds)s" }) + ': {2}'
+$me = "pid $PID, $kind, since {0}, cwd {1}" + $(if ($thread) { ", thread " + ($thread -replace '\{', '{{' -replace '\}', '}}') }) + $(if ($session) { ", session $session" }) + $(if ($null -ne $givenSeconds) { ", estimate $($givenSeconds)s" }) + ': {2}'
 # (HEAVY_QUEUE_SINCE, UTC ticks: a job queued again keeps its place, such as one moved to a newer lock)
 $queuedTicks = if ($env:HEAVY_QUEUE_SINCE -match '^\d{1,20}$') { [long]$env:HEAVY_QUEUE_SINCE } else { [DateTime]::UtcNow.Ticks }
 Remove-Item Env:\HEAVY_QUEUE_SINCE -ErrorAction SilentlyContinue
@@ -806,12 +849,16 @@ try
       $offer = ''; $elsewhere = ''
       continue
     }
+    $startedAt = Get-Date
+    # (ROOT\elsewhere\PID.txt: it runs on a worker, for lock\threads.ps1; made before the ticket goes)
+    $elsewhereFile = Join-Path (Join-Path $root 'elsewhere') "$PID.txt"
+    try { New-Item -ItemType Directory -Force (Split-Path $elsewhereFile) | Out-Null; Write-Shared $elsewhereFile ($me -f $startedAt.ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $label) } catch { }
     Remove-Item $ticket -Force -ErrorAction SilentlyContinue
     Signal-Change
-    $startedAt = Get-Date
     $atStart = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
     Write-Page
     $result = Follow-Remote $offer $elsewhere $plan.Folders
+    Remove-Item -LiteralPath $elsewhereFile -Force -ErrorAction SilentlyContinue
     if ($null -ne $result) { $code = $result; $ranElsewhere = $true; break }
     # Not run there (the worker could not make the checkout): here after all, in its place in the line.
     [Console]::Error.WriteLine("heavy: $elsewhere did not run it: it runs here.")
@@ -820,11 +867,12 @@ try
   }
   if (-not $ranElsewhere)
   {
+    $startedAt = Get-Date
+    # (the holder first, then the ticket goes: a look in between sees the job running, never gone)
+    Write-Shared $holderFile ($me -f $startedAt.ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $label)
     Remove-Item $ticket -Force -ErrorAction SilentlyContinue
     Signal-Change
-    $startedAt = Get-Date
     $atStart = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
-    Write-Shared $holderFile ($me -f $startedAt.ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $label)
     Write-Page
     $runIt = $true
     if ($travelled)
@@ -918,6 +966,8 @@ try
 finally
 {
   Remove-Item $ticket -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath (Join-Path (Join-Path $root 'elsewhere') "$PID.txt") -Force -ErrorAction SilentlyContinue
+  if (-not $travelled) { $now = Thread-Title; if ($now) { $thread = $now } } # (the title the thread gave meanwhile)
   if ($travelled)
   {
     if ($killWithMe) { [void](Kill-With-Me $false) }

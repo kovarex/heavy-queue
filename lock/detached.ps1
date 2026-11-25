@@ -5,6 +5,14 @@ param([string]$jobFile)
 $ErrorActionPreference = 'Stop'
 $job = Get-Content -Raw -LiteralPath $jobFile | ConvertFrom-Json
 Remove-Item -LiteralPath $jobFile -Force -ErrorAction SilentlyContinue
+# (ROOT\detached\ID.PID.session while this process lives: the job's session, for lock\threads.ps1, which
+# finds no record of the job between this file's removal and the job's own place in the line)
+$sessionFile = ''
+if ($job.session -match '^[\w-]+$')
+{
+  $sessionFile = [IO.Path]::ChangeExtension($jobFile, "$PID.session")
+  try { [IO.File]::WriteAllText($sessionFile, "session $($job.session)") } catch { $sessionFile = '' }
+}
 $log = $job.log
 function Append([string]$text) { [IO.File]::AppendAllText($log, $text + "`r`n", (New-Object System.Text.UTF8Encoding($false))) }
 $code = 1
@@ -35,5 +43,6 @@ finally
 {
   Append "heavy: detached job ended $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') with exit code $code."
   [IO.File]::WriteAllText("$log.exit", "$code`r`n", (New-Object System.Text.UTF8Encoding($false)))
+  if ($sessionFile) { Remove-Item -LiteralPath $sessionFile -Force -ErrorAction SilentlyContinue }
 }
 exit $code

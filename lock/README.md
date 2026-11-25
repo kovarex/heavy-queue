@@ -3,6 +3,7 @@
     lock\heavy.cmd [--exclusive] [--name TEXT] [--estimate 90s, 10m or 2h] [--travel] COMMAND LINE...
     lock\heavy.cmd --detach [--log FILE] [the same options] COMMAND LINE...
     lock\heavy.cmd --status
+    lock\heavy.cmd [--thread TITLE] [--shown none|waiting|running] [--watch]   (claude\README.md)
 
 - **One heavy job at a time:** the command runs while it holds the machine's one heavy slot. Builds,
   test runs, links and anything else that loads the whole machine go through it.
@@ -86,8 +87,11 @@ with a line saying where it ran. For whoever started it, the job ran here.
 
 ## Who started a job
 
-The pages' thread column: `HEAVY_QUEUE_THREAD` when set; else, for a job started from a Claude Code
-session of the Claude desktop app, that session's title; else the job's folder.
+The pages' thread column: `HEAVY_QUEUE_THREAD` when set; else the title the thread gave with
+`--thread TITLE`; else, for a job started from a Claude Code session of the Claude desktop app, that session's
+title; else the job's folder. Every job's records name its session (`HEAVY_QUEUE_SESSION`, else the app's
+`CLAUDE_CODE_HOST_SESSION_ID`), so that a thread's title can show whether its job waits or runs:
+`--thread`, `--shown` and `--watch`, and the Stop hook that sees to it, are in claude\README.md.
 
 ## Estimates
 
