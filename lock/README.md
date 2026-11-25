@@ -45,21 +45,24 @@ a Claude Code session an hour after its last turn and ends every process the ses
 
 ## Jobs that travel
 
-A waiting job from a git checkout may run on another machine, a worker, while it waits here (every job but
-an `--exclusive` one, unless `--local`). Once a worker claims it, this machine puts the checkout's exact
-state into the exchange folder both see (`travelExchange`, a NAS share): its commit, the commits no remote
-has (a git bundle), the uncommitted changes and the new files git does not ignore. The worker makes the same
-checkout at the same path (from a mirror of the remote it keeps, so a second time fetches only what is new),
-clears everything git ignores there, and runs the command in the same folder of it. Its output comes back to
-heavy.cmd as it is written; when it ends, every file it made, changed or deleted in the checkout (build
-output included) comes back the same way into this machine's checkout, then its exit code, with a line
-saying where it ran. For whoever started it, the job ran here.
+A waiting job may run on another machine, a worker, while it waits here (every job but an `--exclusive`
+one unless `travelExclusive`, and none unless `--travel` when `travelByDefault` is false; never with
+`--local`). Its folders travel with it: the git checkout or folder it runs in, and the folders its command
+line names and the scripts it names name (a path under one of `travelFolderRoots` stands for its first-level
+folder there, such as one thread's scratch folder; paths under `samePaths` are the same on every machine and
+stay). The worker keeps its own copy of each folder at the same path; once it claims the job it says what
+its copies hold, this machine sends what differs and what to delete through the exchange folder both see
+(`travelExchange`, a NAS share), build outputs and uncommitted files included, and a checkout's git state
+by git (from a mirror of the remote the worker keeps, the commits no remote has as a bundle, HEAD and the
+index at this machine's). So the first job from a folder moves all of it and the next ones little. The
+worker runs the command in the same folder. Its output comes back to heavy.cmd as it is written; when it
+ends, every file it made, changed or deleted in those folders comes back the same way, then its exit code,
+with a line saying where it ran. For whoever started it, the job ran here.
 
-- **Which jobs:** any job from a folder in a git checkout whose command line names nothing outside the
-  checkout (or `samePaths`, the same on every machine). An `--exclusive` job (a timing run) travels only
-  with `--travel`: its numbers belong to this machine's hardware. `--local` keeps any job here. A job
-  outside a git checkout stays here (it cannot be copied). The pages say why a job stays ("stays here: ...")
-  or that it may travel.
+- **Which jobs:** any job whose folders are not whole drives or their first-level folders (too wide) and
+  hold at most `travelMaxFiles` files each. A path the job uses that neither its command line nor the
+  scripts it names show is not seen: such a folder does not travel. The pages say why a job stays
+  ("stays here: ...") or that it may travel.
 - **Which worker:** an open worker whose slot is free and that has nothing queued claims the oldest job it
   may run: the same tools (the offer names its `fingerprint` commands and their output here; the worker runs
   the same commands, again right before it claims), and no `--exclusive` job on a no-benchmarks machine.
@@ -68,16 +71,17 @@ saying where it ran. For whoever started it, the job ran here.
   environment, without what names this machine (COMPUTERNAME, TEMP, ...) and without secrets (any variable
   whose name has TOKEN, SECRET, PASSWORD, KEY, AUTH, CREDENTIAL, ...): a worker keeps its own.
 - **Tools that come along:** folders in `travelTools` (such as `C:\Program Files\kpp`, installed from an
-  unreleased build) are copied into the exchange once per version, and a worker mirrors the home's version
-  over its own at the same path before comparing tools, stopping what runs from there first.
-- **When it cannot go:** uncommitted state over `travelLimitMB` (500), or a worker that cannot make the
-  checkout (its remote out of reach): the job runs here after all, in its place in the line, and says so.
+  unreleased build) are copied into the exchange once per version; a worker mirrors the home's version into
+  its own copy (`ROOT\tools`, never the folder itself, which its own programs use) and runs the job and its
+  fingerprint with that copy in place of the folder.
+- **When it cannot go:** more than `travelLimitMB` (2000) differing between its folders and the worker's
+  copies, or a worker that cannot make the checkout (its remote out of reach): the job runs here after all, in its place in the line, and says so.
 - **When something dies:** a worker that stops answering for `travelStale` seconds (90) ends the job here
   with `heavy: STOPPED: ... Run it again.` and exit 1; its lock and everything the job started are in a job
   object that ends with the lock, so nothing keeps running there. A waiter here that goes away makes the
   worker stop the job.
-- **Files:** `EXCHANGE\ID.*` (lock\travel.ps1 lists them); a worker's checkouts are at the homes' paths, a
-  folder of its own in the way renamed aside, never deleted. The worker writes its note (what it does, or why
+- **Files:** `EXCHANGE\ID.*` (lock\travel.ps1 lists them); a worker's copies are at the homes' paths
+  (`ROOT\copies.txt` lists them), a folder of its own in the way renamed aside, never deleted. The worker writes its note (what it does, or why
   it takes nothing, such as other tools) to its `ROOT\worker.txt`, which its pages and the board show.
 
 ## Who started a job
@@ -124,7 +128,9 @@ default:
 | travelExchange | the folder every machine sees (a NAS share) through which jobs travel | none (nothing travels) |
 | samePaths | paths that are the same on every machine, which a travelling job may name | Program Files, Windows |
 | fingerprint | commands whose output must be the same on two machines for one to run the other's jobs | none |
-| travelLimitMB | the most a travelling job's uncommitted state (changes, new files) may weigh | 500 |
+| travelLimitMB | the most that may differ between a travelling job's folders and the worker's copies | 2000 |
+| travelMaxFiles | a job with a folder holding more files stays here | 300000 |
+| travelFolderRoots | folders whose first-level folders are the unit that travels (such as a scratch folder of per-thread folders) | none |
 | travelExclusive | `--exclusive` jobs (timing runs) travel too, without `--travel`: for machines of the same hardware | false |
 | travelByDefault | jobs travel without `--travel`; false offers only `--travel` jobs, for homes whose jobs use build outputs git ignores (those do not travel: the worker's checkout is clean) | true |
 | travelTools | folders a worker takes from its home when its own differ, mirrored at the same path (such as a compiler installed from an unreleased build); setup-worker.ps1 -Tools gives the worker's user those folders | none |

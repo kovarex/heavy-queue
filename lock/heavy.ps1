@@ -721,6 +721,8 @@ try
         try
         {
           Beat (Travel-File $travelled.id 'alive') 'making its checkout'
+          # (the tools' copies this job runs with: the worker made them before its claim, unless an older worker did)
+          if ($travelled.tools) { $toolWhy = Take-Tools $travelled.tools; if ($toolWhy) { throw $toolWhy } }
           $here = Prepare-Checkout $travelled.id
           $before = Snapshot-Files $script:workerFolders
           Set-Location -LiteralPath $here
