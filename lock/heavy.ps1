@@ -297,7 +297,8 @@ function Write-Page
     foreach ($w in @(Get-ChildItem $queueDir -File -ErrorAction SilentlyContinue | Sort-Object Name))
     {
       $r = Parse-Record ((Get-Content -Raw $w.FullName -ErrorAction SilentlyContinue) + '').Trim()
-      if (-not $r -or -not (Alive $r.Pid)) { continue }
+      if (-not $r) { continue }
+      if (-not (Alive $r.Pid)) { Remove-Item $w.FullName -Force -ErrorAction SilentlyContinue; continue } # (a waiter that died: its entry goes)
       $n++
       $job = [ordered]@{ kind = $r.Kind; thread = (Owner $r.Thread $r.Cwd); folder = (Who $r.Cwd); label = $r.Label; since = (Iso $r.Since) }
       $stays = Read-Small (Join-Path $travelDir "$($w.BaseName).stays")
@@ -406,7 +407,10 @@ tick(); setInterval(tick, 1000);
 }
 
 if ($status) { Show-Status; Write-Page; exit 0 }
-if (-not $line -and -not $travelledFile) { 'usage: heavy.cmd [--detach [--log FILE]] [--exclusive] [--name TEXT] [--estimate 90s|10m|2h] [--local | --travel] COMMAND LINE...  |  heavy.cmd --status'; exit 2 }
+# --help, -h, /? or any option this lock does not know: the usage, never a job (three threads queued "--help"
+# as a command line, 2026-11-25).
+if ($line -match '^(--\S*|-h|-\?|/\?|/h|/help)(\s|$)') { [Console]::Error.WriteLine("heavy: $(if ($matches[1] -match '^(--help|-h|-\?|/\?|/h|/help)$') { 'usage' } else { "unknown option $($matches[1])" })"); $line = '' }
+if (-not $line -and -not $travelledFile) { 'usage:heavy.cmd [--detach [--log FILE]] [--exclusive] [--name TEXT] [--estimate 90s|10m|2h] [--local | --travel] COMMAND LINE...  |  heavy.cmd --status'; exit 2 }
 if ($logGiven -and -not $detach) { [Console]::Error.WriteLine('heavy: --log goes with --detach.'); exit 2 }
 
 # --detach: the same job, started by WMI (so its parent is WMI's service, not this process: whatever ends
@@ -606,6 +610,10 @@ function Machine-Held
 }
 
 $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+# Whoever started this waiter (heavy.cmd's cmd.exe): gone while the job waits (a caller stopped from outside),
+# the job is no longer wanted and leaves the line.
+$parentPid = 0
+try { $parentPid = [int](Get-CimInstance Win32_Process -Filter "ProcessId=$PID").ParentProcessId } catch { }
 $held = $false
 $elsewhere = ''
 $ranElsewhere = $false
@@ -622,6 +630,7 @@ try
     while (-not $held)
     {
       if ($travelled) { Beat (Travel-File $travelled.id 'alive') 'waiting' }
+      if ($parentPid -and -not $travelled -and -not (Alive $parentPid)) { [Console]::Error.WriteLine('heavy: whoever started this job is gone: it leaves the line.'); $code = 1; exit 1 }
       if ($offer)
       {
         # (the offer names the tools of now: refreshed every 5 minutes while it waits)
