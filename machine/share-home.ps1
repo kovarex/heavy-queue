@@ -29,6 +29,7 @@ $account = $identity.Name
 $readOnlyFolders = @($ReadOnly | ForEach-Object { (Resolve-Path $_).Path.TrimEnd('\') })
 foreach ($folder in $travelRoots)
 {
+  if (-not (Test-Path -LiteralPath $folder)) { "$folder does not exist: not shared (take it out of travelRoots)"; continue }
   $full = (Resolve-Path $folder).Path.TrimEnd('\')
   $shareName = Split-Path -Leaf $full
   $asReadOnly = @($readOnlyFolders | Where-Object { $_ -ieq $full }).Count -gt 0
