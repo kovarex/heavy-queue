@@ -9,7 +9,8 @@
 #   this runs too (this machine's own lock, its gate and the board).
 # -User: the home's user for its shares (asked when not given; the password is always typed by you).
 # What it does, and says:
-# 1. This computer remembers the sign-in for the home's shares (cmdkey).
+# 1. This computer remembers the sign-in for the home's shares (cmdkey): from -SignInFile (share-home.ps1
+#    -WorkerAccount wrote it), else the user (-User, or asked) and the password you type.
 # 2. A scheduled task here that runs a script from a folder about to become the home's is stopped and
 #    removed, and so is a PowerShell running one: a gate of an older setup there would write the home's
 #    hold file and hold all its jobs.
@@ -26,6 +27,7 @@ param(
   [Parameter(Mandatory = $true)][string]$HomeData,
   [Parameter(Mandatory = $true)][string]$PublishFile,
   [string]$User = '',
+  [string]$SignInFile = '',
   [string]$Name = '',
   [switch]$NoBenchmarks)
 $ErrorActionPreference = 'Stop'
@@ -35,16 +37,26 @@ $clone = Split-Path $PSScriptRoot
 
 # 1. The sign-in for the home's shares: asked for once when they cannot be read yet. (Each share is tried
 # by its path: net view's list needs the old browser service, "System error 1702" where it is off.)
-function Missing-Shares { return @($Shares | Where-Object { -not (Test-Path -LiteralPath "\$HomeName\$_") }) }
+function Missing-Shares { return @($Shares | Where-Object { -not (Test-Path -LiteralPath "\\$HomeName\$_") }) }
 if ((Missing-Shares).Count -gt 0)
 {
-  if (-not $User) { $User = Read-Host "The user for \$HomeName's shares (its local user, or MicrosoftAccount\your@e-mail)" }
+  if ($SignInFile)
+  {
+    # (share-home.ps1 -WorkerAccount wrote it: the account's user name, then its password)
+    $signIn = @(Get-Content $SignInFile -TotalCount 2)
+    & cmdkey "/add:$HomeName" "/user:$($signIn[0].Trim())" "/pass:$($signIn[1].Trim())" | Out-Null
+    "the sign-in for \\$($HomeName): $($signIn[0].Trim()), from $SignInFile"
+  }
+  else
+  {
+  if (-not $User) { $User = Read-Host "The user for \\$HomeName's shares (its local user, or MicrosoftAccount\your@e-mail)" }
   & cmdkey "/add:$HomeName" "/user:$User" /pass
+  }
   $missing = Missing-Shares
-  if ($missing.Count -gt 0) { throw "cannot read \$HomeName\$($missing -join ', \' + $HomeName + '\'): is machine\share-home.ps1 run there, is it on, and is the sign-in right?" }
+  if ($missing.Count -gt 0) { throw "cannot read \\$HomeName\$($missing -join ', \\' + $HomeName + '\'): is machine\share-home.ps1 run there, is it on, and is the sign-in right?" }
 }
 $shares = $Shares
-"shares of \$($HomeName): $($shares -join ', ')"
+"shares of \\$($HomeName): $($shares -join ', ')"
 
 # 2. What would run the home's scripts once its folders are here.
 $mapped = @($shares | ForEach-Object { "c:\$($_.ToLowerInvariant())\" })
