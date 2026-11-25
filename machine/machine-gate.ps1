@@ -26,7 +26,17 @@ while ($true)
   $lines = @(Get-Content $schedule -ErrorAction SilentlyContinue)
   if ($lines.Count -eq 0) { $lines = @($line, '# Line 1 is read by the heavy lock: "HOLD: yes" or "HOLD: no". machine-gate.ps1 writes it from the board.') }
   elseif ($lines[0] -ne $line) { $lines[0] = $line } else { $lines = $null }
-  if ($lines) { New-Item -ItemType Directory -Force (Split-Path $schedule) | Out-Null; Set-Content -Path $schedule -Value $lines -Encoding UTF8 }
+  if ($lines)
+  {
+    # (a hold file it cannot write leaves the machine held whatever the board says: said in ROOT\gate-error.txt,
+    # else in this user's temp folder, and on the next try)
+    try { New-Item -ItemType Directory -Force (Split-Path $schedule) | Out-Null; Set-Content -Path $schedule -Value $lines -Encoding UTF8 -ErrorAction Stop }
+    catch
+    {
+      $message = "$(Get-Date -Format s) the gate cannot write ${schedule}: $($_.Exception.Message)"
+      try { Set-Content -Path (Join-Path $root 'gate-error.txt') -Value $message -ErrorAction Stop } catch { Set-Content -Path (Join-Path $env:TEMP 'heavy-queue-gate-error.txt') -Value $message -ErrorAction SilentlyContinue }
+    }
+  }
   if ($state -eq 'stopped')
   {
     $holder = ((Get-Content -Raw (Join-Path $root 'holder.txt') -ErrorAction SilentlyContinue) + '').Trim()

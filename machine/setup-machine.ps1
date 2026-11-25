@@ -25,6 +25,12 @@ if ($DataFolder -or $Name)
 }
 . (Join-Path $clone 'lock\config.ps1')
 New-Item -ItemType Directory -Force $root, (Split-Path $schedule) | Out-Null
+# (run as administrator, what this makes would belong to Administrators, and the gate, the publisher and the
+# lock, which run as this user, could not write it: 2026-11-25 on OBYVAK, the gate could not open the machine)
+foreach ($folder in @($root, (Split-Path $schedule)) | Select-Object -Unique)
+{
+  & icacls $folder /grant "$($env:USERDOMAIN)\$($env:USERNAME):(OI)(CI)M" /T /C /Q | Out-Null
+}
 Copy-Item $PublishFile (Join-Path $root 'publish.txt') -Force
 if ($NoBenchmarks) { New-Item -ItemType File -Force (Join-Path $root 'no-benchmarks') | Out-Null } else { Remove-Item (Join-Path $root 'no-benchmarks') -Force -ErrorAction SilentlyContinue }
 if ($Shim) { Set-Content $Shim "@echo off`r`ncall `"$clone\lock\heavy.cmd`" %*`r`nexit /b %errorlevel%`r`n" -Encoding ascii }
