@@ -82,13 +82,34 @@ function Move-Over([string]$from, [string]$to)
 
 function Alive([int]$id) { return $null -ne (Get-Process -Id $id -ErrorAction SilentlyContinue) }
 
+# The line's order, the same for every waiter and page: the queue files' names hold when each job was queued
+# and its estimate when it was (TICKS-PID-eSECONDS.txt), so the order depends on nothing that changes. With
+# shortestFirst (the default), the job with the smallest estimate plus the time it was queued goes first: a
+# shorter job passes a longer one, and every second a job waits counts as a second off its estimate, so a long
+# job passes everything queued after it once it has waited its own length and starves nobody. A job without
+# an estimate counts as unknownEstimate seconds (an hour); a file from an older lock (no estimate) too.
+# shortestFirst false: first come, first served.
+function Queue-Order
+{
+  $list = foreach ($w in @(Get-ChildItem $queueDir -File -ErrorAction SilentlyContinue))
+  {
+    if ($w.Name -notmatch '^(\d{20})-(\d+)(?:-e(\d+))?\.txt$') { continue }
+    $id = [int]$matches[2]
+    if ($id -ne $PID -and -not (Alive $id)) { Remove-Item $w.FullName -Force -ErrorAction SilentlyContinue; continue } # (a waiter that died)
+    $eta = if ($matches[3]) { [double]$matches[3] } else { [double]$unknownEstimate }
+    $queued = [double]([long]$matches[1] / 10000000)
+    [pscustomobject]@{ File = $w; Pid = $id; Id = "$($matches[1])-$($matches[2])"; Key = $(if ($shortestFirst) { $eta + $queued } else { $queued }) }
+  }
+  return @($list | Sort-Object Key, Id)
+}
+
 function Show-Status
 {
   $text = if (Test-Path $holderFile) { (Get-Content -Raw $holderFile -ErrorAction SilentlyContinue).Trim() } else { '' }
   if ($text -match '^pid (\d+)' -and (Alive ([int]$matches[1]))) { 'holder: ' + $text } else { 'holder: none' }
-  $waiting = @(Get-ChildItem $queueDir -File -ErrorAction SilentlyContinue | Sort-Object Name)
+  $waiting = @(Queue-Order)
   'waiting: ' + $waiting.Count
-  foreach ($w in $waiting) { '  ' + (Get-Content -Raw $w.FullName -ErrorAction SilentlyContinue).Trim() }
+  foreach ($w in $waiting) { '  ' + (Get-Content -Raw $w.File.FullName -ErrorAction SilentlyContinue).Trim() }
 }
 
 # status.html: the holder, the queue and the last 200 finished jobs (history.tsv), written again on
@@ -294,16 +315,16 @@ function Write-Page
     $mdQueue = New-Object System.Text.StringBuilder
     $queue = New-Object System.Text.StringBuilder
     $n = 0
-    foreach ($w in @(Get-ChildItem $queueDir -File -ErrorAction SilentlyContinue | Sort-Object Name))
+    foreach ($q in @(Queue-Order))
     {
+      $w = $q.File
       $r = Parse-Record ((Get-Content -Raw $w.FullName -ErrorAction SilentlyContinue) + '').Trim()
       if (-not $r) { continue }
-      if (-not (Alive $r.Pid)) { Remove-Item $w.FullName -Force -ErrorAction SilentlyContinue; continue } # (a waiter that died: its entry goes)
       $n++
       $job = [ordered]@{ kind = $r.Kind; thread = (Owner $r.Thread $r.Cwd); folder = (Who $r.Cwd); label = $r.Label; since = (Iso $r.Since) }
-      $stays = Read-Small (Join-Path $travelDir "$($w.BaseName).stays")
+      $stays = Read-Small (Join-Path $travelDir "$($q.Id).stays")
       $travelNote = ''
-      if ($travelExchange -and (Test-Path (Join-Path $travelExchange "$($w.BaseName).job.json"))) { $job.travel = $true; $travelNote = ' (may travel)' }
+      if ($travelExchange -and (Test-Path (Join-Path $travelExchange "$($q.Id).job.json"))) { $job.travel = $true; $travelNote = ' (may travel)' }
       elseif ($stays) { $job.stays = $stays; $travelNote = " (stays here: $stays)" }
       $e = Estimate $r
       $estText = ''; $startText = ''
@@ -561,7 +582,8 @@ if ($given)
 }
 $me = "pid $PID, $kind, since {0}, cwd {1}" + $(if ($thread) { ", thread " + ($thread -replace '\{', '{{' -replace '\}', '}}') }) + $(if ($null -ne $givenSeconds) { ", estimate $($givenSeconds)s" }) + ': {2}'
 $ticketName = '{0:D20}-{1}' -f [DateTime]::UtcNow.Ticks, $PID
-$ticket = Join-Path $queueDir "$ticketName.txt"
+$queueGuess = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
+$ticket = Join-Path $queueDir ("$ticketName-e{0}.txt" -f $(if ($queueGuess) { [int]$queueGuess.seconds } else { [int]$unknownEstimate }))
 $queuedAt = Get-Date
 Write-Shared $ticket ($me -f $queuedAt.ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $label)
 
@@ -592,16 +614,17 @@ if (-not $travelled)
 }
 Write-Page
 
+# (waiters of an older lock order the line by age alone: when nobody has held the slot for 15 s, the oldest
+# waiter takes it whatever the order says, so two that disagree never wait for each other)
+$script:freeSince = $null
 function First-In-Queue
 {
-  foreach ($w in @(Get-ChildItem $queueDir -File -ErrorAction SilentlyContinue | Sort-Object Name))
-  {
-    $id = [int](($w.BaseName -split '-')[1])
-    if ($id -eq $PID) { return $true }
-    if (Alive $id) { return $false }
-    Remove-Item $w.FullName -Force -ErrorAction SilentlyContinue
-  }
-  return $true
+  $order = @(Queue-Order)
+  if ($order.Count -eq 0 -or $order[0].Pid -eq $PID) { $script:freeSince = $null; return $true }
+  if (Test-Path $holderFile) { $script:freeSince = $null; return $false }
+  if (-not $script:freeSince) { $script:freeSince = Get-Date; return $false }
+  if (((Get-Date) - $script:freeSince).TotalSeconds -lt 15) { return $false }
+  return ((@($order | Sort-Object Id)[0]).Pid -eq $PID)
 }
 
 # Why this waiter may not start yet besides the slot, or $null. A quiet flag whose holder died is removed.

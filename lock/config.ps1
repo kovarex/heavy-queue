@@ -23,6 +23,8 @@ $idleSeconds = [int](Setting 'idleSeconds' 20)
 # run each other's jobs, how much a job's uncommitted state may weigh, and, for testing two machines on one
 # computer only, a folder a worker puts its checkouts under (else they are at the home's paths).
 $travelExchange = Setting 'travelExchange' ''
+$shortestFirst = [bool](Setting 'shortestFirst' $true) # (the line's order: heavy.ps1's Queue-Order)
+$unknownEstimate = [int](Setting 'unknownEstimate' 3600) # (seconds, for a job nothing is known about)
 $samePaths = @(Setting 'samePaths' @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:windir) | ForEach-Object { "$_" })
 $fingerprintCommands = @(Setting 'fingerprint' @() | ForEach-Object { "$_" })
 $travelLimitMB = [int](Setting 'travelLimitMB' 2000) # (what may differ between a job's folders here and the worker's copies)
