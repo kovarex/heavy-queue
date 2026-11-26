@@ -86,7 +86,7 @@ function Move-Over([string]$from, [string]$to)
   for ($i = 0; ; $i++)
   {
     try { Move-Item -Force -LiteralPath $from -Destination $to; return }
-    catch { if ($i -ge 20) { Remove-Item -LiteralPath $from -Force -ErrorAction SilentlyContinue; throw }; Start-Sleep -Milliseconds 100 }
+    catch { if ($i -ge 20) { Drop-File $from; throw }; Start-Sleep -Milliseconds 100 }
   }
 }
 
@@ -111,8 +111,8 @@ function Queue-Order
     $data = $matches[2].StartsWith('d')
     $id = if ($data) { 0 } else { [int]$matches[2] }
     # (a waiter that died, or a waiting detached job whose job file is gone: started, or given up)
-    if ($data) { if (-not (Test-Path -LiteralPath (Join-Path $root "detached\$($matches[2]).json"))) { Remove-Item $w.FullName -Force -ErrorAction SilentlyContinue; continue } }
-    elseif ($id -ne $PID -and -not $running.Contains($id)) { Remove-Item $w.FullName -Force -ErrorAction SilentlyContinue; continue }
+    if ($data) { if (-not (Test-Path -LiteralPath (Join-Path $root "detached\$($matches[2]).json"))) { Drop-File $w.FullName; continue } }
+    elseif ($id -ne $PID -and -not $running.Contains($id)) { Drop-File $w.FullName; continue }
     $eta = if ($matches[3]) { [double]$matches[3] } else { [double]$unknownEstimate }
     $queued = [double]([long]$matches[1] / 10000000)
     [pscustomobject]@{ File = $w; Pid = $id; Data = $data; Ticks = $matches[1]; JobId = $(if ($data) { $matches[2] } else { '' }); Id = "$($matches[1])-$($matches[2])"; Key = $(if ($matches[4]) { -1e12 } else { 0 }) + $(if ($shortestFirst) { $eta + $queued } else { $queued }) }
@@ -579,7 +579,7 @@ if ($detach)
   if ($env:HEAVY_QUEUE_THREAD) { $environment['HEAVY_QUEUE_THREAD'] = $env:HEAVY_QUEUE_THREAD }
   if ($session) { $environment['HEAVY_QUEUE_SESSION'] = $session }
   New-Item -ItemType Directory -Force (Split-Path $log) | Out-Null
-  Remove-Item -LiteralPath "$log.exit" -Force -ErrorAction SilentlyContinue
+  Drop-File "$log.exit"
   [IO.File]::WriteAllText($log, '', (New-Object System.Text.UTF8Encoding($false)))
   # (waiting, it is data: this job file and its place in the line; the dispatcher starts its process)
   $dataId = 'd{0}x{1}' -f (Get-Date -Format 'yyyyMMddHHmmss'), $PID
@@ -719,7 +719,7 @@ $ticket = Join-Path $queueDir ("$ticketName-e{0}{1}.txt" -f $(if ($queueGuess) {
 $queuedAt = ([DateTime]::new($queuedTicks, [DateTimeKind]::Utc)).ToLocalTime()
 Write-Shared $ticket ($me -f $queuedAt.ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $label)
 # (a detached job the dispatcher started: its own file now stands in the line, the waiting one goes)
-if ($env:HEAVY_QUEUE_ENTRY) { Remove-Item -LiteralPath $env:HEAVY_QUEUE_ENTRY -Force -ErrorAction SilentlyContinue; Remove-Item Env:\HEAVY_QUEUE_ENTRY -ErrorAction SilentlyContinue }
+if ($env:HEAVY_QUEUE_ENTRY) { Drop-File $env:HEAVY_QUEUE_ENTRY; Remove-Item Env:\HEAVY_QUEUE_ENTRY -ErrorAction SilentlyContinue }
 
 # The offer, when this job may travel (lock\travel.ps1); when it asked to travel and may not, the reason.
 $offer = ''
@@ -771,7 +771,7 @@ function Machine-Held
   if (Test-Path $flag)
   {
     $text = (Get-Content -Raw $flag -ErrorAction SilentlyContinue) + ''
-    if ($text -match 'heavy pid (\d+)' -and -not (Alive ([int]$matches[1]))) { Remove-Item $flag -Force -ErrorAction SilentlyContinue }
+    if ($text -match 'heavy pid (\d+)' -and -not (Alive ([int]$matches[1]))) { Drop-File $flag }
   }
   $why = Hold-Reason
   if ($why) { return $why }
@@ -853,12 +853,12 @@ try
     # (ROOT\elsewhere\PID.txt: it runs on a worker, for lock\threads.ps1; made before the ticket goes)
     $elsewhereFile = Join-Path (Join-Path $root 'elsewhere') "$PID.txt"
     try { New-Item -ItemType Directory -Force (Split-Path $elsewhereFile) | Out-Null; Write-Shared $elsewhereFile ($me -f $startedAt.ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $label) } catch { }
-    Remove-Item $ticket -Force -ErrorAction SilentlyContinue
+    Drop-File $ticket
     Signal-Change
     $atStart = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
     Write-Page
     $result = Follow-Remote $offer $elsewhere $plan.Folders
-    Remove-Item -LiteralPath $elsewhereFile -Force -ErrorAction SilentlyContinue
+    Drop-File $elsewhereFile
     if ($null -ne $result) { $code = $result; $ranElsewhere = $true; break }
     # Not run there (the worker could not make the checkout): here after all, in its place in the line.
     [Console]::Error.WriteLine("heavy: $elsewhere did not run it: it runs here.")
@@ -870,7 +870,7 @@ try
     $startedAt = Get-Date
     # (the holder first, then the ticket goes: a look in between sees the job running, never gone)
     Write-Shared $holderFile ($me -f $startedAt.ToString('MM-dd HH:mm:ss'), (Get-Location).Path, $label)
-    Remove-Item $ticket -Force -ErrorAction SilentlyContinue
+    Drop-File $ticket
     Signal-Change
     $atStart = Estimate ([pscustomobject]@{ Given = $givenSeconds; Label = $label; Thread = $thread; Cwd = (Get-Location).Path; Kind = $kind })
     Write-Page
@@ -951,7 +951,7 @@ try
       if (Test-Path $stopped)
       {
         $stopWhy = ((Get-Content -Raw $stopped -ErrorAction SilentlyContinue) + '').Trim()
-        Remove-Item $stopped -Force -ErrorAction SilentlyContinue
+        Drop-File $stopped
       }
       elseif ($script:abandoned) { $stopWhy = "its home ($($travelled.machine)) stopped waiting for it." }
       if ($stopWhy)
@@ -965,8 +965,8 @@ try
 }
 finally
 {
-  Remove-Item $ticket -Force -ErrorAction SilentlyContinue
-  Remove-Item -LiteralPath (Join-Path (Join-Path $root 'elsewhere') "$PID.txt") -Force -ErrorAction SilentlyContinue
+  Drop-File $ticket
+  Drop-File (Join-Path (Join-Path $root 'elsewhere') "$PID.txt")
   if (-not $travelled) { $now = Thread-Title; if ($now) { $thread = $now } } # (the title the thread gave meanwhile)
   if ($travelled)
   {
@@ -977,8 +977,8 @@ finally
   {
     if ($held)
     {
-      if ($exclusive -and $runIt) { Remove-Item $flag -Force -ErrorAction SilentlyContinue }
-      Remove-Item $holderFile -Force -ErrorAction SilentlyContinue
+      if ($exclusive -and $runIt) { Drop-File $flag }
+      Drop-File $holderFile
       $mutex.ReleaseMutex()
       Signal-Change
     }

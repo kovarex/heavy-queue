@@ -30,6 +30,11 @@
 
 $travelDir = Join-Path $root 'travel'
 
+# Removes a file if it is there, never failing: several waiters clean the same stale queue file, and
+# Remove-Item on one another just removed threw a terminating error past -ErrorAction (five benchmark jobs
+# died of it on 2026-11-26 at 03:12).
+function Drop-File([string]$path) { if ($path) { try { [IO.File]::Delete($path) } catch { } } }
+
 # A path's normalised form for prefix tests: full, lower case, ending in '\'; $null when it is no path.
 function Folder-Key([string]$path)
 {
@@ -378,7 +383,7 @@ function Fresh([string]$path)
 function Remove-Travel([string]$id)
 {
   Remove-Item (Join-Path $travelExchange "$id.*") -Force -ErrorAction SilentlyContinue
-  Remove-Item (Travel-File $id 'stays') -Force -ErrorAction SilentlyContinue
+  Drop-File (Travel-File $id 'stays')
 }
 
 # The travel files of this machine's jobs whose waiter died: gone, unless a worker still runs the job (it
@@ -560,7 +565,7 @@ function Pack-State([string]$id, [string]$cwd, $folders)
         $names = Join-Path $env:TEMP "heavy-send-$PID.txt"
         Write-List $names $diff[0]
         $r = Run-Beating "$env:windir\System32\tar.exe" @('-cf', (Travel-File $id "f$i.tar"), '-C', $f, '--null', '-T', $names) (Travel-File $id 'waiting') 'waiting'
-        Remove-Item $names -Force -ErrorAction SilentlyContinue
+        Drop-File $names
         if ($r.Code -ne 0) { throw "tar of $($f): $($r.Err.Trim())" }
       }
       if ($diff[1].Count) { [IO.File]::WriteAllLines((Travel-File $id "f$i.del"), [string[]]$diff[1], (New-Object System.Text.UTF8Encoding($false))) }
@@ -713,7 +718,7 @@ function Pack-Back([string]$id, $folders, $before)
       $names = Join-Path $env:TEMP "heavy-back-$PID.txt"
       Write-List $names $diff[0]
       $r = Run-Beating "$env:windir\System32\tar.exe" @('-cf', (Travel-File $id "b$i.tar"), '-C', @($folders)[$i], '--null', '-T', $names) (Travel-File $id 'alive') 'sending its files back'
-      Remove-Item $names -Force -ErrorAction SilentlyContinue
+      Drop-File $names
       if ($r.Code -ne 0) { throw "tar of the job's files: $($r.Err.Trim())" }
     }
     if ($diff[1].Count) { [IO.File]::WriteAllLines((Travel-File $id "b$i.del"), [string[]]$diff[1], (New-Object System.Text.UTF8Encoding($false))) }
