@@ -139,6 +139,7 @@ function Travel-Plan([string]$cwd, [string]$commandLine, [bool]$forbid, [bool]$a
   # (the scripts the command line names, read for the paths they name: one level, 64 KB each at most)
   foreach ($p in @($todo))
   {
+    if ([string]::IsNullOrWhiteSpace($p)) { continue }
     if ($p -match '\.(cmd|bat|ps1|py|sh)$' -and (Test-Path -LiteralPath $p -PathType Leaf) -and (Get-Item -LiteralPath $p).Length -lt 65536)
     {
       foreach ($q in (Travel-Paths ([IO.File]::ReadAllText($p)) '')) { [void]$todo.Add($q) }
@@ -146,7 +147,10 @@ function Travel-Plan([string]$cwd, [string]$commandLine, [bool]$forbid, [bool]$a
   }
   foreach ($p in $todo)
   {
-    if (-not (Test-Path -LiteralPath $p)) { continue }
+    # (an empty or odd token, such as what is left of "C:\..." trimmed, is no path: 21 nightly jobs died of
+    # Test-Path "" on 2026-11-27)
+    if ([string]::IsNullOrWhiteSpace($p)) { continue }
+    try { if (-not (Test-Path -LiteralPath $p)) { continue } } catch { continue }
     $f = Travel-Folder $p
     if (-not $f) { continue }
     if ($f.StartsWith('!')) { return [pscustomobject]@{ Why = $f.Substring(1); Folders = @() } }

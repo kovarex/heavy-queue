@@ -728,7 +728,8 @@ $offer = ''
 if (-not $travelled)
 {
   # (every job may travel but an --exclusive one: a timing run's numbers belong to this machine unless it asks)
-  $plan = Travel-Plan (Get-Location).Path $line $stayHere ($mayTravel -or ($travelByDefault -and ((-not $exclusive) -or $travelExclusive)))
+  # (planning never fails a job: whatever goes wrong in it keeps the job here, saying why)
+  try {$plan = Travel-Plan (Get-Location).Path $line $stayHere ($mayTravel -or ($travelByDefault -and ((-not $exclusive) -or $travelExclusive))) } catch { $plan = [pscustomobject]@{ Why = "its travel plan failed: $($_.Exception.Message)"; Folders = @() } }
   $stayReason = $plan.Why
   if (-not $stayReason)
   {
