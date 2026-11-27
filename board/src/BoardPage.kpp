@@ -33,7 +33,7 @@ button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid
 <h2>Running</h2>
 <div class="wrap"><table><thead><tr><th>machine</th><th>kind</th><th>thread</th><th>command</th><th>started</th><th>running</th><th>estimate</th><th>done</th></tr></thead><tbody id="running"></tbody></table></div>
 <h2>Waiting</h2>
-<div class="wrap"><table><thead><tr><th>machine</th><th>#</th><th>kind</th><th>thread</th><th>command</th><th>queued</th><th>waiting</th><th>estimate</th><th>runs</th></tr></thead><tbody id="queue"></tbody></table></div>
+<div class="wrap"><table><thead><tr><th>machine</th><th>#</th><th>kind</th><th>thread</th><th>command</th><th>queued</th><th>waiting</th><th>estimate</th><th>starts in</th><th>runs</th></tr></thead><tbody id="queue"></tbody></table></div>
 <h2>Finished</h2>
 <div class="wrap"><table><thead><tr><th>machine</th><th>kind</th><th>thread</th><th>command</th><th>started</th><th>waited</th><th>took</th><th>estimate</th><th>exit</th></tr></thead><tbody id="finished"></tbody></table></div>
 <script>
@@ -97,12 +97,13 @@ function draw(all) {
     (s.queue || []).forEach(function (q, i) { var r = queue.insertRow(); cell(r, m.name); cell(r, i + 1); cell(r, q.kind, q.kind); cell(r, q.thread || q.folder);
       note(cell(r, q.label, 'cmd'), q.travel ? '(may travel)' : q.stays ? '(stays here: ' + q.stays + ')' : ''); cell(r, t(q.since));
       cell(r, '').dataset.since = q.since; cell(r, est(q));
-      if (next == null) cell(r, !m.open ? 'machine closed' : s.held ? 'held' : '', 'muted');
-      else { var from = next; next = q.estimate == null ? null : next + q.estimate * 1000; cell(r, hm(from) + (next == null ? '' : ' - ' + hm(next))); } });
+      if (next == null) { cell(r, '', 'muted'); cell(r, !m.open ? 'machine closed' : s.held ? 'held' : '', 'muted'); }
+      else { var from = next; next = q.estimate == null ? null : next + q.estimate * 1000; cell(r, from <= Date.now() + 30000 ? 'next' : d((from - Date.now()) / 1000));
+        cell(r, hm(from) + (next == null ? '' : ' - ' + hm(next))); } });
     (s.finished || []).forEach(function (f) { f.machine = m.name; ended.push(f); });
   });
   if (!running.rows.length) none(running, 8, 'nothing running');
-  if (!queue.rows.length) none(queue, 9, 'nobody waiting');
+  if (!queue.rows.length) none(queue, 10, 'nobody waiting');
   ended.sort(function (a, b) { return new Date(b.ended) - new Date(a.ended); });
   ended.slice(0, 200).forEach(function (f) { var r = finished.insertRow(); cell(r, f.machine); cell(r, f.kind, f.kind); cell(r, f.thread || f.folder);
     note(cell(r, f.label, 'cmd'), f.ranOn ? '(ran on ' + f.ranOn + ')' : ''); cell(r, t(f.started, true));
