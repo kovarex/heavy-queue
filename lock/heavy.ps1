@@ -461,7 +461,13 @@ if ($null -ne $threadGiven -or $shownGiven -or $watch)
 {
   $heavyCmd = if ($env:HEAVY_QUEUE_CALLED_AS) { $env:HEAVY_QUEUE_CALLED_AS } else { Join-Path $PSScriptRoot 'heavy.cmd' }
   if (-not $session) { [Console]::Error.WriteLine('heavy: no session (neither HEAVY_QUEUE_SESSION nor CLAUDE_CODE_HOST_SESSION_ID): no thread to record.'); if ($shownGiven -or $watch -or -not $line) { exit 2 } }
-  if ($session -and $null -ne $threadGiven) { $t = ($threadGiven -replace '^\s*(\u23F3|\u2699\uFE0F?)\s*', '').Trim(); Save-Thread-Record $session @{ title = $t } }
+  # (a title holds no quotes or backslashes: a shell's escaped quotes, \"TITLE\", once became part of a title,
+  # which then gained a layer of escaping with each job, 2026-11-27; an empty one records nothing)
+  if ($session -and $null -ne $threadGiven)
+  {
+    $t = (($threadGiven -replace '[\\"]', '') -replace '^\s*(\u23F3|\u2699\uFE0F?)\s*', '').Trim()
+    if ($t) { Save-Thread-Record $session @{ title = $t } }
+  }
   if ($line -and ($shownGiven -or $watch)) { [Console]::Error.WriteLine('heavy: --shown and --watch take no command line.'); exit 2 }
   if ($watch)
   {
