@@ -166,6 +166,8 @@ function Thread-Title
 function Who([string]$cwd)
 {
   if ($cwd -match '\\\.claude\\worktrees\\([^\\]+)') { return $matches[1] }
+  # (a scheduled task starts in the Windows folder: its name says more than "Windows\system32")
+  if ($env:windir -and ($cwd.TrimEnd('\') + '\').ToLowerInvariant().StartsWith(($env:windir.TrimEnd('\') + '\').ToLowerInvariant())) { return 'scheduled task' }
   $parts = @($cwd.TrimEnd('\') -split '\\')
   if ($parts.Count -ge 2) { return $parts[-2] + '\' + $parts[-1] }
   return $cwd
