@@ -1,10 +1,10 @@
 # Lets the board's buttons open and close this machine. Every 15 seconds it asks the board (ROOT\publish.txt's
 # address) whether this machine (the config's machine name) is open, and writes the answer into line 1 of
 # the hold file, which the lock reads before starting a job: "HOLD: no" when open, "HOLD: yes (closed on
-# the board)" when closed or when the board cannot be reached. A closed machine starts no new heavy job; the
+# the board)" when closed; a board that cannot be reached, or gives no answer it knows, changes nothing. A closed machine starts no new heavy job; the
 # one running finishes (Close) or is stopped at once (Close now: "stopped"): its command's processes are
 # killed and the lock prints "heavy: STOPPED: ..." with a nonzero exit code, so whoever started it can run
-# it again here or elsewhere. A board that cannot be reached holds new jobs but stops none. The rest of the
+# it again here or elsewhere. A board that cannot be reached neither holds nor stops anything. The rest of the
 # hold file is kept. Started at logon (setup-machine.ps1 registers it); one at a time.
 . (Join-Path (Split-Path $PSScriptRoot) 'lock\config.ps1')
 $mutex = New-Object System.Threading.Mutex($false, "$mutexName-machine-gate")
@@ -22,9 +22,12 @@ while ($true)
     $state = $answer.Content.Trim()
   }
   catch { }
-  $line = if ($state -eq 'open') { 'HOLD: no' } elseif ($state -eq 'unreachable') { 'HOLD: yes (the board cannot be reached)' } else { 'HOLD: yes (closed on the board)' }
+  # (only the board's own answer changes the hold: a board that cannot be reached, or answers something else,
+  # leaves the machine as it was; it once held every job for half an hour, 2026-11-28)
+  $line = if ($state -eq 'open') { 'HOLD: no' } elseif ($state -eq 'closed' -or $state -eq 'stopped') { 'HOLD: yes (closed on the board)' } else { $null }
   $lines = @(Get-Content $schedule -ErrorAction SilentlyContinue)
-  if ($lines.Count -eq 0) { $lines = @($line, '# Line 1 is read by the heavy lock: "HOLD: yes" or "HOLD: no". machine-gate.ps1 writes it from the board.') }
+  if (-not $line) { $lines = $null }
+  elseif ($lines.Count -eq 0) { $lines = @($line, '# Line 1 is read by the heavy lock: "HOLD: yes" or "HOLD: no". machine-gate.ps1 writes it from the board.') }
   elseif ($lines[0] -ne $line) { $lines[0] = $line } else { $lines = $null }
   if ($lines)
   {
